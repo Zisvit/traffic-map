@@ -2,18 +2,25 @@
 
 Precedence, highest first: command line, ``TMAP_*`` environment variables,
 ``config.toml``, built-in defaults. Missing config file is not an error.
+
+Error contract: argparse usage errors (unknown options such as ``--bogus``,
+missing option values) raise ``SystemExit(2)``; ``--help`` raises
+``SystemExit(0)``. Invalid values raise ``ValueError``. ``__main__`` maps both
+to exit code 2 later (Task 9).
 """
 
 import argparse
 import os
 import tomllib
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 ASSETS = Path(__file__).resolve().parents[2] / "assets"
-DEFAULT_CACHE = (
-    Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "trafficmap"
-)
+
+
+def default_cache_dir() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
+    return Path(base) / "trafficmap"
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,7 +30,7 @@ class Config:
     city_db: Path = ASSETS / "dbip-city-lite.mmdb"
     asn_db: Path | None = ASSETS / "dbip-asn-lite.mmdb"
     land_geojson: Path = ASSETS / "land.geojson"
-    cache_dir: Path = DEFAULT_CACHE
+    cache_dir: Path = field(default_factory=default_cache_dir)
     ascii: bool = False
     no_anchor: bool = False
     anchor: tuple[float, float] | None = None
@@ -69,11 +76,10 @@ def _read_toml(path: Path) -> dict[str, object]:
             data = tomllib.load(handle)
     except FileNotFoundError:
         return {}
+    except OSError as exc:
+        raise ValueError(f"cannot read config {path}: {exc}") from exc
     except tomllib.TOMLDecodeError as exc:
         raise ValueError(f"invalid TOML in {path}: {exc}") from exc
-
-    if not isinstance(data, dict):
-        raise ValueError(f"invalid config in {path}: expected a table")
 
     unknown = sorted(set(data) - _KNOWN_KEYS)
     if unknown:
@@ -84,7 +90,8 @@ def _read_toml(path: Path) -> dict[str, object]:
 
 def _env_values() -> dict[str, object]:
     values: dict[str, object] = {}
-    for name in _KNOWN_KEYS:
+    for spec in fields(Config):
+        name = spec.name
         raw = os.environ.get(f"TMAP_{name.upper()}", "")
         if raw:
             values[name] = raw
@@ -104,12 +111,25 @@ def _build_parser() -> argparse.ArgumentParser:
     add(
         "--cache-dir", metavar="PATH", default=argparse.SUPPRESS, help="cache directory"
     )
-    add("--ascii", action="store_true", default=argparse.SUPPRESS, help="ASCII mode")
+    add(
+        "--ascii",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help="ASCII mode",
+    )
     add(
         "--no-anchor",
         action="store_true",
+        dest="no_anchor",
         default=argparse.SUPPRESS,
         help="do not resolve the local anchor",
+    )
+    add(
+        "--resolve-anchor",
+        action="store_false",
+        dest="no_anchor",
+        default=argparse.SUPPRESS,
+        help="force anchor resolution",
     )
     add(
         "--anchor", metavar="LAT,LON", default=argparse.SUPPRESS, help="anchor position"
@@ -146,12 +166,14 @@ def _convert(name: str, value: object) -> object:
 
 
 def _as_int(name: str, value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
+    number: int | None = None
+    if not isinstance(value, bool) and isinstance(value, (int, str)):
+        try:
+            number = int(value)
+        except ValueError:
+            pass
+    if number is None:
         raise ValueError(f"{name} must be an integer, got {value!r}")
-    try:
-        number = int(value)
-    except ValueError:
-        raise ValueError(f"{name} must be an integer, got {value!r}") from None
 
     minimum = _INT_MINIMUMS[name]
     if number < minimum:
@@ -184,11 +206,14 @@ def _as_path(name: str, value: object, *, optional: bool) -> Path | None:
         raise ValueError(f"{name} must be a path, got None")
     if not isinstance(value, (str, Path)):
         raise ValueError(f"{name} must be a path, got {value!r}")
-    if isinstance(value, str) and not value:
-        if optional:
+    if isinstance(value, str) and not value.strip():
+        if optional and not value:
             return None
         raise ValueError(f"{name} must not be empty")
-    return Path(value).expanduser()
+    try:
+        return Path(value).expanduser()
+    except (RuntimeError, KeyError) as exc:
+        raise ValueError(f"{name}: cannot expand path {value!r}: {exc}") from exc
 
 
 def _as_anchor(value: object) -> tuple[float, float] | None:
@@ -203,7 +228,7 @@ def _as_anchor(value: object) -> tuple[float, float] | None:
     else:
         raise ValueError(f"anchor must be 'LAT,LON', got {value!r}")
 
-    if len(parts) != 2:
+    if len(parts) != 2 or any(isinstance(part, bool) for part in parts):
         raise ValueError(f"anchor must be 'LAT,LON', got {value!r}")
     try:
         lat, lon = (float(part) for part in parts)

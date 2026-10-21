@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from trafficmap.config import ASSETS, DEFAULT_CACHE, Config, load_config
+from trafficmap.config import ASSETS, Config, load_config
 
 
 @pytest.fixture(autouse=True)
@@ -28,7 +28,7 @@ def test_default_values_for_paths():
     assert cfg.city_db == ASSETS / "dbip-city-lite.mmdb"
     assert cfg.asn_db == ASSETS / "dbip-asn-lite.mmdb"
     assert cfg.land_geojson == ASSETS / "land.geojson"
-    assert cfg.cache_dir == DEFAULT_CACHE
+    assert cfg.cache_dir == Path.home() / ".cache" / "trafficmap"
     assert cfg.anchor is None
     assert cfg.frames == 0
 
@@ -40,6 +40,7 @@ def test_cli_overrides_env(tmp_path, monkeypatch):
         path=tmp_path / "none.toml",
     )
     assert cfg.fps == 30
+    assert cfg.city_db == tmp_path / "c.mmdb"
 
 
 def test_env_used_when_cli_absent(tmp_path, monkeypatch):
@@ -132,6 +133,18 @@ def test_bad_env_bool_raises(tmp_path, monkeypatch):
         load_config([], path=tmp_path / "none.toml")
 
 
+def test_cli_no_ascii_overrides_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("TMAP_ASCII", "1")
+    cfg = load_config(["--no-ascii"], path=tmp_path / "none.toml")
+    assert cfg.ascii is False
+
+
+def test_cli_resolve_anchor_overrides_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("TMAP_NO_ANCHOR", "1")
+    cfg = load_config(["--resolve-anchor"], path=tmp_path / "none.toml")
+    assert cfg.no_anchor is False
+
+
 @pytest.mark.parametrize("flag", ["--fps", "--poll-ms"])
 def test_non_positive_values_raise(tmp_path, flag):
     with pytest.raises(ValueError):
@@ -173,6 +186,12 @@ def test_default_path_uses_xdg_config_home(tmp_path, monkeypatch):
     (config_dir / "trafficmap" / "config.toml").write_text("fps = 5\n")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(config_dir))
     assert load_config([]).fps == 5
+
+
+def test_cache_dir_uses_xdg_cache_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    cfg = load_config([], path=tmp_path / "none.toml")
+    assert cfg.cache_dir == tmp_path / "trafficmap"
 
 
 def test_config_is_frozen():
