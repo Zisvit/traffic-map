@@ -13,3 +13,4 @@ tcp   LISTEN     0      1024                                127.0.0.1:9050      
 udp   UNCONN     0      0                                     0.0.0.0:37716                 0.0.0.0:*     users:(("kdeconnectd",pid=4815,fd=25))
 tcp   TIME-WAIT  0      0                                   127.0.0.1:37854               127.0.0.1:10808
 	
+tcp   ESTAB      0      0                                                *:*                    *:*

@@ -5,6 +5,7 @@ with commands that pretend to be ``ss``.
 """
 
 import shlex
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
@@ -84,7 +85,9 @@ def test_key_format(fixture_text):
 def test_garbage_line_is_skipped(fixture_text):
     text = fixture_text + "this is not a socket line\n\tand not counters either\n"
     rows = parse_sockets(text)
-    assert len(rows) == len(parse_sockets(fixture_text))
+    assert len(rows) == 5
+    assert "tcp|10.0.0.2:51000|1.1.1.1:443|100" in {r.key for r in rows}
+    assert not any("not a socket line" in r.key for r in rows)
 
 
 def test_time_wait_is_skipped(fixture_text):
@@ -111,12 +114,82 @@ def test_process_name_with_spaces():
     assert r.process == "My App" and r.pid == 42
 
 
+def test_output_without_a_header_keeps_the_first_socket():
+    text = (
+        "tcp   ESTAB      0      0   10.0.0.2:51000   1.1.1.1:443\n"
+        "tcp   ESTAB      0      0   10.0.0.3:51001   1.1.1.2:443\n"
+    )
+    rows = parse_sockets(text)
+    assert len(rows) == 2
+    assert rows[0].key == "tcp|10.0.0.2:51000|1.1.1.1:443|None"
+    assert rows[1].key == "tcp|10.0.0.3:51001|1.1.1.2:443|None"
+
+
+def test_a_line_before_the_header_keeps_the_first_socket():
+    text = (
+        "ss: something worth a warning\n"
+        + HEADER
+        + "tcp   ESTAB      0      0   10.0.0.2:51000   1.1.1.1:443\n"
+    )
+    rows = parse_sockets(text)
+    assert len(rows) == 1
+    assert rows[0].key == "tcp|10.0.0.2:51000|1.1.1.1:443|None"
+
+
+def test_the_wildcard_row_of_the_fixture_is_skipped(fixture_text):
+    rows = parse_sockets(fixture_text)
+    # The last row of the fixture reads ``*:*`` on both sides: it talks
+    # to nobody and is dropped.
+    assert len(rows) == 5
+    assert all(r.local != ("*", 0) for r in rows)
+    assert all(r.remote != ("*", 0) for r in rows)
+
+
+def test_a_wildcard_address_is_read_as_port_zero():
+    text = HEADER + "tcp   ESTAB      0      0        *:*   1.1.1.1:443\n"
+    row = parse_sockets(text)[0]
+    assert row.local == ("*", 0)
+
+
+def test_a_counter_with_a_suffix_is_unknown():
+    text = (
+        HEADER
+        + "tcp   ESTAB      0      0   10.0.0.2:51000   1.1.1.1:443\n"
+        + "\tcubic bytes_sent:15M bytes_received:9K\n"
+    )
+    r = parse_sockets(text)[0]
+    assert r.bytes_sent is None and r.bytes_received is None
+
+
+def test_collector_reads_bytes_that_are_not_text(tmp_path):
+    out = tmp_path / "ss.out"
+    out.write_bytes(
+        b"tcp   ESTAB      0      0   10.0.0.2:51000   1.1.1.1:443"
+        b'   users:(("pro\xffcess",pid=7,fd=1))\n'
+    )
+    rows = SsCollector(command=["cat", str(out)]).poll()
+    assert len(rows) == 1
+    assert rows[0].pid == 7
+    assert rows[0].process is not None and "pro" in rows[0].process
+
+
 def test_collector_raises_on_error():
     collector = SsCollector(command=["sh", "-c", "exit 3"])
     with pytest.raises(RuntimeError) as info:
         collector.poll()
     message = str(info.value)
-    assert "exit 3" in message and "3" in message
+    assert shlex.join(["sh", "-c", "exit 3"]) in message
+    assert "code 3" in message
+
+
+def test_collector_raises_on_timeout():
+    collector = SsCollector(command=["sh", "-c", "sleep 5"], timeout=0.2)
+    with pytest.raises(RuntimeError) as info:
+        collector.poll()
+    message = str(info.value)
+    assert "sleep 5" in message
+    assert "timed out" in message
+    assert "0.2" in message
 
 
 def test_collector_reads_the_fixture():
@@ -146,5 +219,5 @@ def test_row_is_frozen():
         bytes_received=9000,
         key="tcp|10.0.0.2:51000|1.1.1.1:443|100",
     )
-    with pytest.raises(Exception):
+    with pytest.raises(FrozenInstanceError):
         row.pid = 101

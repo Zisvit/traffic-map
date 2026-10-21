@@ -11,9 +11,10 @@ The output of ``ss -t -u -a -i -n -p`` is a table::
                                        users:(("curl",pid=100,fd=3))
     \t bbr wscale:7,7 rto:204 ... bytes_sent:1200 bytes_received:9000 ...
 
-The first line is the header of the table.  The lines that follow a
-socket line are indented and carry the counters of the socket above
-them; a UDP socket usually has none.
+The header of the table is recognised by its first word and is never
+read as a socket.  The lines that follow a socket line are indented
+and carry the counters of the socket above them; a UDP socket usually
+has none.
 
 Only the sockets that can still carry traffic are of interest.  A
 listening socket has no peer yet, a socket whose peer is a wildcard
@@ -68,8 +69,9 @@ _PROCESS_RE = re.compile(
     r"users:\(\((?:\"(?P<quoted>[^\"]*)\"|(?P<bare>[^,]*)),\s*pid=(?P<pid>\d+)"
 )
 
-#: The counters of the indented lines.
-_COUNTER_RE = re.compile(r"\bbytes_(sent|received):(\d+)")
+#: The counters of the indented lines.  A value that carries a suffix
+#: (``15M``) is not a plain number and is therefore left unknown.
+_COUNTER_RE = re.compile(r"\bbytes_(sent|received):(\d+)\b")
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,11 +127,15 @@ def parse_sockets(text: str) -> list[SocketRow]:
         listening sockets, the sockets without a peer and the closed
         ones are left out.  A line that cannot be read is skipped
         instead of raising.
+
+    Note:
+        The header is found by its first word, so an output without a
+        header (``ss -H``) and a warning line before the table keep
+        their first socket.
     """
     rows: list[SocketRow] = []
     fields: _Fields | None = None
     counters: list[str] = []
-    first = True
 
     for raw in text.splitlines():
         if not raw.strip():
@@ -145,11 +151,8 @@ def parse_sockets(text: str) -> list[SocketRow]:
             fields = None
             counters = []
 
-        if first:
-            # The header of the table.
-            first = False
-            continue
         if raw.split(None, 1)[0].lower() in HEADER_WORDS:
+            # The header of the table.
             continue
 
         fields = _read_line(raw)
@@ -206,9 +209,14 @@ class SsCollector:
                 self._command,
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=self._timeout,
                 check=False,
             )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"{self._describe()} timed out after {self._timeout} s"
+            ) from exc
         except (OSError, subprocess.SubprocessError) as exc:
             raise RuntimeError(f"{self._describe()} failed: {exc}") from exc
 
