@@ -5,6 +5,7 @@ without curses, and the interface is asked for its answer when there is
 no terminal at all.
 """
 
+import os
 from pathlib import Path
 
 import pytest
@@ -28,24 +29,37 @@ FIXTURE = Path(__file__).parent / "fixtures" / "mock.jsonl"
 EXPECTED_LINES = SNAPSHOT_ROWS
 EXPECTED_MAP_LINES = SNAPSHOT_ROWS - STATUS_ROWS
 
+#: The first and the last character of the Braille block.
+BRAILLE_FIRST = "⠀"
+BRAILLE_LAST = "⣿"
+
+
+def is_root() -> bool:
+    """Tell whether the tests run as root."""
+    geteuid = getattr(os, "geteuid", None)
+    return geteuid is not None and geteuid() == 0
+
 
 def snapshot_path(tmp_path: Path, name: str = "frame.txt") -> Path:
     """Return the path of a snapshot of the recording."""
     return tmp_path / name
 
 
-def make_snapshot(tmp_path: Path, *extra: str, frames: str = "10") -> str:
+def make_snapshot(
+    tmp_path: Path, *extra: str, frames: str = "10", name: str = "frame.txt"
+) -> str:
     """Make a snapshot of the recording and return its text.
 
     Args:
         tmp_path: The directory the snapshot is written to.
         extra: Other arguments of the command line.
         frames: The number of frames to render.
+        name: The name of the file the snapshot is written to.
 
     Returns:
         The text of the snapshot.
     """
-    out = snapshot_path(tmp_path)
+    out = snapshot_path(tmp_path, name)
     code = main(
         [
             "--mock",
@@ -133,6 +147,47 @@ def test_snapshot_without_frames_still_writes_a_frame(tmp_path):
     )
     assert rc == 0
     assert out.exists()
+
+
+def test_the_ascii_snapshot_has_no_braille_character(tmp_path):
+    """The ASCII mode draws the map with plain ASCII characters."""
+    text = make_snapshot(tmp_path, "--ascii")
+    assert "#" in text, "the land is not on the map"
+    assert "*" in text, "the peers are not on the map"
+    braille = [char for char in text if BRAILLE_FIRST <= char <= BRAILLE_LAST]
+    assert braille == [], f"the ASCII frame holds Braille characters: {braille!r}"
+
+
+def test_the_ascii_snapshot_has_the_same_shape(tmp_path):
+    """The ASCII map is as big as the Braille one."""
+    braille = make_snapshot(tmp_path, name="braille.txt")
+    ascii_ = make_snapshot(tmp_path, "--ascii", name="ascii.txt")
+    assert len(braille.splitlines()) == len(ascii_.splitlines())
+    assert len(ascii_.splitlines()) == EXPECTED_LINES
+    assert any(BRAILLE_FIRST <= char <= BRAILLE_LAST for char in braille)
+    assert not any(BRAILLE_FIRST <= char <= BRAILLE_LAST for char in ascii_)
+
+
+def test_the_ascii_snapshot_shows_the_same_status_bar(tmp_path):
+    """The status bar does not depend on the way the map is drawn."""
+    braille = make_snapshot(tmp_path, name="braille.txt")
+    ascii_ = make_snapshot(tmp_path, "--ascii", name="ascii.txt")
+    assert braille.splitlines()[-3:] == ascii_.splitlines()[-3:]
+
+
+@pytest.mark.skipif(is_root(), reason="the tests run as root")
+def test_the_banner_of_the_root_is_on_the_third_line(tmp_path):
+    """Without root the user is told that only his own sockets are seen."""
+    text = make_snapshot(tmp_path)
+    lines = text.splitlines()
+    assert "no root: only your sockets" in lines[-1]
+
+
+@pytest.mark.skipif(not is_root(), reason="the tests do not run as root")
+def test_there_is_no_banner_when_the_program_runs_as_root(tmp_path):
+    """With root the banner of the root is not shown."""
+    text = make_snapshot(tmp_path)
+    assert "no root" not in text
 
 
 def test_snapshot_to_a_missing_directory_fails(tmp_path, capsys):

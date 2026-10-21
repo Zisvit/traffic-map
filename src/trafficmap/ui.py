@@ -36,6 +36,14 @@ The peers of the hidden flows are kept, they are only not drawn: the
 filter is therefore reversible, and the numbers of the status bar
 count the flows that are on the map.
 
+The ASCII mode
+--------------
+The Braille characters of the Unicode block U+2800 need a font that has
+them.  When the terminal has none, the ``--ascii`` option draws the map
+with plain ASCII characters instead: one character per cell, the glyph
+of the style of the cell.  The colours are the same, the canvas is the
+same, only the characters change.
+
 The snapshot
 ------------
 :func:`snapshot` runs the same pipeline without a terminal: the frames
@@ -204,6 +212,22 @@ _PLAIN_BY_STYLE: dict[int, int] = {
     STYLE_PEER: _C_PEER,
     STYLE_ANCHOR: _C_ANCHOR,
 }
+
+#: The glyph of every style of the canvas, for the ASCII mode.  The
+#: empty cell is a space, so that the grid keeps its places.
+_ASCII_GLYPHS: dict[int, str] = {
+    0: " ",
+    STYLE_LAND: "#",
+    STYLE_TRAIL_DIM: "-",
+    STYLE_TRAIL_MID: "-",
+    STYLE_TRAIL_BRIGHT: "-",
+    STYLE_PEER: "*",
+    STYLE_COMET_HEAD: "+",
+    STYLE_ANCHOR: "O",
+}
+
+#: The glyph of a cell whose style is not known.
+_ASCII_UNKNOWN = " "
 
 #: The units of the rates, in bytes per second.
 _RATE_UNITS = (
@@ -779,6 +803,34 @@ def _colour_of(style: int, direction: str | None) -> int:
     return _PLAIN_BY_STYLE.get(style, _C_DEFAULT)
 
 
+def _text_rows(canvas: Canvas, styles: list[list[int]], ascii_mode: bool) -> list[str]:
+    """Return the text of every character row of the map.
+
+    The Braille mode uses the characters the canvas builds: one cell of
+    the canvas is one character of the Unicode block U+2800, and the
+    eight dots of the cell are the eight dots of the character.
+
+    The ASCII mode uses one character per cell instead: the character is
+    the glyph of the style of the cell, so a terminal whose font has no
+    Braille glyphs still shows the map.  The styles are the same, only
+    the characters change.
+
+    Args:
+        canvas: The canvas of the map.
+        styles: The style of every cell of the canvas, one list per row.
+        ascii_mode: Whether the map is drawn with ASCII characters.
+
+    Returns:
+        The text of the rows of the map, one string per character row.
+    """
+    if not ascii_mode:
+        return canvas.rows()
+    return [
+        "".join(_ASCII_GLYPHS.get(style, _ASCII_UNKNOWN) for style in row)
+        for row in styles
+    ]
+
+
 def _render(map_: _Map, state: _State, now: float, stats: Stats) -> _Frame:
     """Draw one frame of the map.
 
@@ -797,8 +849,8 @@ def _render(map_: _Map, state: _State, now: float, stats: Stats) -> _Frame:
     viewport = map_.viewport()
     state.animator.draw(canvas, viewport, now)
 
-    text_rows = canvas.rows()
     style_rows = canvas.cell_styles()
+    text_rows = _text_rows(canvas, style_rows, state.cfg.ascii)
     overrides = _in_cells(state.animator, viewport, canvas.width, canvas.height, now)
 
     rows: list[list[tuple[str, int]]] = []

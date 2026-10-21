@@ -14,7 +14,16 @@ from pathlib import Path
 
 import pytest
 
-from trafficmap.anim import STYLE_ANCHOR, STYLE_PEER, Animator
+from trafficmap.anim import (
+    STYLE_ANCHOR,
+    STYLE_COMET_HEAD,
+    STYLE_LAND,
+    STYLE_PEER,
+    STYLE_TRAIL_BRIGHT,
+    STYLE_TRAIL_DIM,
+    STYLE_TRAIL_MID,
+    Animator,
+)
 from trafficmap.braille import Canvas
 from trafficmap.config import Config
 from trafficmap.flows import Flow, FlowTable, Opened, Stats
@@ -26,6 +35,7 @@ from trafficmap.ui import (
     SNAPSHOT_COLS,
     SNAPSHOT_ROWS,
     ZOOM_SPANS,
+    _ASCII_GLYPHS,
     _C_IN,
     _C_WARNING,
     _CollectorThread,
@@ -34,6 +44,7 @@ from trafficmap.ui import (
     _colour_of,
     _in_cells,
     _status_lines,
+    _text_rows,
 )
 
 ASSETS = Path(__file__).resolve().parents[1] / "assets"
@@ -627,3 +638,27 @@ def test_the_head_of_a_new_incoming_comet_is_cyan():
     point = project(FAR_PEER.lat, FAR_PEER.lon, viewport)
     assert cells[point[1] // 4][point[0] // 2] == "in"
     assert _colour_of(6, "in") == _C_IN[2]
+
+
+def test_every_style_has_its_ascii_glyph():
+    """The ASCII mode has a glyph for every style of the canvas."""
+    assert _ASCII_GLYPHS[0] == " "
+    assert _ASCII_GLYPHS[STYLE_LAND] == "#"
+    assert _ASCII_GLYPHS[STYLE_TRAIL_DIM] == "-"
+    assert _ASCII_GLYPHS[STYLE_TRAIL_MID] == "-"
+    assert _ASCII_GLYPHS[STYLE_PEER] == "*"
+    assert _ASCII_GLYPHS[STYLE_TRAIL_BRIGHT] == "-"
+    assert _ASCII_GLYPHS[STYLE_COMET_HEAD] == "+"
+    assert _ASCII_GLYPHS[STYLE_ANCHOR] == "O"
+
+
+def test_the_ascii_rows_hold_the_glyph_of_the_style():
+    """A cell of the ASCII map holds the glyph of its dominant style."""
+    canvas = Canvas(4, 8)
+    canvas.set(0, 0, STYLE_PEER)
+    styles = canvas.cell_styles()
+    assert styles == [[STYLE_PEER, 0], [0, 0]]
+    assert _text_rows(canvas, styles, True) == ["* ", "  "]
+    # The Braille mode is not touched by the ASCII one.
+    assert _text_rows(canvas, styles, False) == canvas.rows()
+    assert all("⠀" <= char <= "⣿" for char in canvas.rows()[0])
