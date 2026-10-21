@@ -7,19 +7,22 @@ drawing surface - a flat grid of dots, each dot carrying an integer
 
 Style semantics
 ---------------
-``0`` means "empty".  Higher styles are drawn on top of lower ones: a dot
+``0`` means "empty".  Styles are priority numbers in the range
+``0..255``; anything outside that range is rejected with a
+``ValueError``.  Higher styles are drawn on top of lower ones: a dot
 keeps the maximum style ever set on it, so a bright element (a comet head,
-style 6) is never dimmed by a dimmer one (land, style 1).  The style of a
-character cell is the maximum over its eight dots - that is what the
-renderer uses to group cells into coloured runs.
+style 6) is never dimmed by a dimmer one (land, style 1).  Style ``0`` is
+a no-op - a dot can never be erased.  The style of a character cell is the
+maximum over its eight dots - that is what the renderer uses to group
+cells into coloured runs.
 
 Performance
 -----------
 The renderer redraws up to twelve times per second on a grid of a few
 hundred thousand dots, so :meth:`Canvas.rows` and
 :meth:`Canvas.cell_styles` are computed with bulk byte operations
-(``bytes.translate`` plus integer bitwise tricks) instead of per-dot
-Python loops, and both results are cached until the canvas changes again.
+instead of per-dot Python loops, and both results are cached until the
+canvas changes again.
 """
 
 __all__ = ["BITS", "Canvas"]
@@ -40,6 +43,20 @@ _CELL_HEIGHT = 4
 #: Style of the land background.
 _LAND_STYLE = 1
 
+#: Highest style a dot can carry - styles are stored in a single byte.
+_MAX_STYLE = 255
+
+
+def _check_style(style: int) -> int:
+    """Return the style, checking that it fits into one byte.
+
+    Raises:
+        ValueError: If the style is outside the range ``0..255``.
+    """
+    if not 0 <= style <= _MAX_STYLE:
+        raise ValueError(f"style must be in the range 0..{_MAX_STYLE}, got {style}")
+    return style
+
 
 def _mask_table(dy: int, dx: int) -> bytes:
     """Return the translation table "non-zero dot -> its Braille bit"."""
@@ -54,26 +71,14 @@ _MASK_TABLES = tuple(
     for dy in range(_CELL_HEIGHT)
 )
 
-# Translation table: any non-zero dot becomes 1.
-_ONES_TABLE = bytes(1 if value else 0 for value in range(256))
+# Translation table: any non-zero dot becomes the land style.
+_LAND_TABLE = bytes(_LAND_STYLE if value else 0 for value in range(256))
 
 # Translation table: an empty dot becomes 0xFF, a drawn dot becomes zero.
 _ZERO_TABLE = bytes(0xFF if value == 0 else 0x00 for value in range(256))
 
 # Braille character for every possible dot mask.
 _BRAILLE = tuple(chr(0x2800 | mask) for mask in range(256))
-
-# Translation tables "style >= threshold -> 1", built on demand.
-_GE_TABLES: dict[int, bytes] = {}
-
-
-def _ge_table(threshold: int) -> bytes:
-    """Return the translation table "style >= threshold -> 1, else 0"."""
-    table = _GE_TABLES.get(threshold)
-    if table is None:
-        table = bytes(1 if value >= threshold else 0 for value in range(256))
-        _GE_TABLES[threshold] = table
-    return table
 
 
 class Canvas:
@@ -94,9 +99,6 @@ class Canvas:
         self.height = height + (-height % _CELL_HEIGHT)
         self._dots = bytearray(self.width * self.height)
         self._cache: tuple[list[str], list[list[int]]] | None = None
-        # Highest style in the canvas (0 when it is empty).  Keeping it
-        # around makes the per-frame style scan short.
-        self._max_style = 0
 
     @property
     def cell_width(self) -> int:
@@ -112,22 +114,29 @@ class Canvas:
         """Erase every dot."""
         self._dots[:] = bytes(len(self._dots))
         self._cache = None
-        self._max_style = 0
 
     def set(self, x: int, y: int, style: int = 1) -> None:
         """Set the style of one dot.
 
         The dot keeps the maximum style ever set on it, so a dimmer
-        element never overwrites a brighter one.  Coordinates outside the
-        grid are ignored.
+        element never overwrites a brighter one.  Style ``0`` is a no-op:
+        a dot can never be erased.  Coordinates outside the grid are
+        ignored.
+
+        Args:
+            x: Dot column.
+            y: Dot row.
+            style: Style of the dot, in the range ``0..255``.
+
+        Raises:
+            ValueError: If the style is outside the range ``0..255``.
         """
+        _check_style(style)
         if 0 <= x < self.width and 0 <= y < self.height:
             index = y * self.width + x
             if style > self._dots[index]:
                 self._dots[index] = style
                 self._cache = None
-                if style > self._max_style:
-                    self._max_style = style
 
     def dot_style(self, x: int, y: int) -> int:
         """Return the style of one dot (0 outside the grid)."""
@@ -139,8 +148,20 @@ class Canvas:
         """Draw a straight line with Bresenham's algorithm.
 
         Every point of the line gets ``style``; points outside the grid
-        are clipped away.
+        are clipped away.  Style ``0`` is a no-op: a dot can never be
+        erased.
+
+        Args:
+            x0: Column of the first point.
+            y0: Row of the first point.
+            x1: Column of the last point.
+            y1: Row of the last point.
+            style: Style of the line, in the range ``0..255``.
+
+        Raises:
+            ValueError: If the style is outside the range ``0..255``.
         """
+        _check_style(style)
         grid = self._dots
         width = self.width
         height = self.height
@@ -176,8 +197,6 @@ class Canvas:
                 y0 += sy
         if changed:
             self._cache = None
-            if style > self._max_style:
-                self._max_style = style
 
     def blit_land(self, mask: bytes | bytearray) -> None:
         """Paint land pixels from a flat mask of 0/1 values.
@@ -187,23 +206,29 @@ class Canvas:
         lowers an existing style - land is the background.
 
         Args:
-            mask: Flat sequence of 0/1 land flags, one per dot.
+            mask: Flat sequence of 0/1 land flags, one per dot.  Every
+                value must fit into a style byte (``0..255``).
 
         Raises:
-            ValueError: If the mask length does not match the canvas.
+            ValueError: If the mask length does not match the canvas, or
+                if a mask value is outside the range ``0..255``.
         """
         size = self.width * self.height
         if len(mask) != size:
             raise ValueError(f"land mask must hold {size} dots, got {len(mask)}")
+        try:
+            land_mask = bytes(mask)
+        except ValueError as exc:
+            raise ValueError(
+                f"land mask values must be in the range 0..{_MAX_STYLE}"
+            ) from exc
         # Only empty dots take the land style: the result is the current
         # grid OR-ed with (land AND empty-dots).
-        land = int.from_bytes(bytes(mask).translate(_ONES_TABLE), "big")
+        land = int.from_bytes(land_mask.translate(_LAND_TABLE), "big")
         empty = int.from_bytes(self._dots.translate(_ZERO_TABLE), "big")
         dots = int.from_bytes(self._dots, "big")
         self._dots = bytearray(((land & empty) | dots).to_bytes(size, "big"))
         self._cache = None
-        if self._max_style < _LAND_STYLE:
-            self._max_style = _LAND_STYLE
 
     def cell_char(self, cx: int, cy: int) -> str:
         """Return the Braille character of one cell.
@@ -259,17 +284,19 @@ class Canvas:
     def cell_styles(self) -> list[list[int]]:
         """Return the style of every cell, one list per character row.
 
-        The result is cached and must be treated as read-only.
+        The result is a fresh copy of the cached styles, so the caller
+        may modify it without corrupting the canvas.
         """
-        return self._rendered()[1]
+        return [list(row) for row in self._rendered()[1]]
 
     def rows(self) -> list[str]:
         """Return the canvas as text, one string per character row.
 
         Every line holds exactly ``cell_width`` Braille characters.  The
-        result is cached and must be treated as read-only.
+        result is a fresh copy of the cached rows, so the caller may
+        modify it without corrupting the canvas.
         """
-        return self._rendered()[0]
+        return list(self._rendered()[0])
 
     def _check_cell(self, cx: int, cy: int) -> None:
         """Reject cell coordinates outside the canvas."""
@@ -291,7 +318,6 @@ class Canvas:
         """Build the text rows and the per-cell styles from the dots."""
         width = self.width
         grid = self._dots
-        thresholds = self._style_thresholds()
         rows: list[str] = []
         styles: list[list[int]] = []
         for cy in range(self.cell_height):
@@ -301,17 +327,8 @@ class Canvas:
                 for dy in range(_CELL_HEIGHT)
             ]
             rows.append("".join([_BRAILLE[mask] for mask in _row_masks(dot_rows)]))
-            styles.append(list(_row_styles(dot_rows, thresholds)))
+            styles.append(list(_row_styles(dot_rows)))
         return rows, styles
-
-    def _style_thresholds(self) -> list[int]:
-        """Return the styles present in the canvas, in ascending order.
-
-        ``value in grid`` is a memchr scan, which is far cheaper than
-        building a set out of every dot.  Only the styles up to the
-        highest one in the canvas are looked for.
-        """
-        return [value for value in range(1, self._max_style + 1) if value in self._dots]
 
 
 def _row_masks(dot_rows: list[bytes | bytearray]) -> bytes:
@@ -331,36 +348,22 @@ def _row_masks(dot_rows: list[bytes | bytearray]) -> bytes:
     return acc.to_bytes(len(dot_rows[0]) // _CELL_WIDTH, "big")
 
 
-def _row_styles(dot_rows: list[bytes | bytearray], thresholds: list[int]) -> bytes:
+def _row_styles(dot_rows: list[bytes | bytearray]) -> bytes:
     """Return the maximum dot style of every cell of one character row.
 
-    The maximum is found by walking the candidate styles in ascending
-    order: a cell takes the style of the highest threshold that any of
-    its dots reaches, and every threshold is checked with bulk byte
-    operations instead of a per-dot loop.
+    Every cell of the row owns eight dots: the left and the right
+    column of the four dot rows.  Slicing the two columns apart leaves
+    eight byte strings that hold one dot slot per cell, and the maximum
+    of those eight values is the style of the cell.
 
     Args:
         dot_rows: The four dot rows of the character row.
-        thresholds: The distinct non-zero styles of the whole canvas, in
-            ascending order.
 
     Returns:
         One byte per cell, holding the maximum style of that cell.
     """
-    cells = len(dot_rows[0]) // _CELL_WIDTH
-    if not thresholds:
-        return bytes(cells)
-    full = (1 << (8 * cells)) - 1
-    ones = int.from_bytes(b"\x01" * cells, "big")
-    result = 0
-    for threshold in thresholds:
-        table = _ge_table(threshold)
-        mask = 0
-        for row in dot_rows:
-            mask |= int.from_bytes(row[0::2].translate(table), "big")
-            mask |= int.from_bytes(row[1::2].translate(table), "big")
-        # Cells reached by the mask take the threshold style, the others
-        # keep the style found so far.
-        select = (mask * 0xFF) & full
-        result = (result & (select ^ full)) | (select & (threshold * ones))
-    return result.to_bytes(cells, "big")
+    columns = []
+    for row in dot_rows:
+        columns.append(row[0::2])
+        columns.append(row[1::2])
+    return bytes(map(max, *columns))

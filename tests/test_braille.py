@@ -38,6 +38,26 @@ def _reference_styles(canvas: Canvas) -> list[list[int]]:
     return out
 
 
+def _naive_cell_styles(canvas: Canvas) -> list[list[int]]:
+    """Independent per-cell implementation of the cell styles.
+
+    Every cell is visited on its own and the maximum of its eight dots
+    is taken, without any bulk byte operation.
+    """
+    out = []
+    for cy in range(canvas.cell_height):
+        row = []
+        for cx in range(canvas.cell_width):
+            dots = [
+                canvas.dot_style(cx * 2 + dx, cy * 4 + dy)
+                for dy in range(4)
+                for dx in range(2)
+            ]
+            row.append(max(dots))
+        out.append(row)
+    return out
+
+
 def test_corner_bits():
     c = Canvas(2, 4)
     c.set(0, 0, 1)
@@ -116,6 +136,47 @@ def test_set_defaults_to_style_one():
     c = Canvas(2, 4)
     c.set(0, 0)
     assert c.cell_style(0, 0) == 1
+
+
+def test_the_highest_style_is_accepted():
+    c = Canvas(2, 4)
+    c.set(0, 0, 255)
+    assert c.cell_style(0, 0) == 255
+    assert c.cell_styles() == [[255]]
+
+
+def test_set_with_a_style_above_the_byte_range_raises():
+    c = Canvas(2, 4)
+    with pytest.raises(ValueError, match=r"0\.\.255"):
+        c.set(0, 0, 256)
+
+
+def test_set_with_a_negative_style_raises():
+    c = Canvas(2, 4)
+    with pytest.raises(ValueError, match=r"0\.\.255"):
+        c.set(0, 0, -1)
+
+
+def test_line_with_a_style_above_the_byte_range_raises():
+    c = Canvas(4, 4)
+    with pytest.raises(ValueError, match=r"0\.\.255"):
+        c.line(0, 0, 2, 2, 300)
+
+
+def test_blit_land_with_a_value_above_the_byte_range_raises():
+    c = Canvas(4, 4)
+    with pytest.raises(ValueError, match=r"0\.\.255"):
+        c.blit_land([256] * 16)
+
+
+def test_style_zero_cannot_erase_a_dot():
+    """Style 0 is a no-op: a dot keeps the style it already has."""
+    c = Canvas(2, 4)
+    c.set(0, 0, 4)
+    c.set(0, 0, 0)
+    c.line(0, 1, 1, 1, 0)
+    assert c.cell_style(0, 0) == 4
+    assert c.cell_styles() == [[4]]
 
 
 def test_line_draws_a_horizontal_run():
@@ -258,6 +319,30 @@ def test_cache_follows_the_dots():
     assert c.cell_styles() == [[2, 0]]
 
 
+def test_rows_returns_a_copy_of_the_cache():
+    """Mutating the returned rows must not corrupt the canvas."""
+    c = Canvas(4, 4)
+    c.set(0, 0, 2)
+    rows = c.rows()
+    assert rows is not c.rows()
+    rows[0] = "broken"
+    rows.append("extra")
+    assert c.rows() == [chr(0x2801) + chr(0x2800)]
+    assert len(c.rows()) == 1
+
+
+def test_cell_styles_returns_a_copy_of_the_cache():
+    """Mutating the returned styles must not corrupt the canvas."""
+    c = Canvas(4, 4)
+    c.set(0, 0, 2)
+    styles = c.cell_styles()
+    assert styles is not c.cell_styles()
+    styles[0][0] = 99
+    styles.append([1, 2])
+    assert c.cell_styles() == [[2, 0]]
+    assert len(c.cell_styles()) == 1
+
+
 def test_fast_paths_match_the_reference_implementation():
     """The bulk byte operations must agree with a per-dot implementation."""
     rng = random.Random(20261021)
@@ -277,6 +362,18 @@ def test_fast_paths_match_the_reference_with_land():
         c.set(rng.randrange(c.width), rng.randrange(c.height), rng.randrange(1, 8))
     assert c.rows() == _reference_rows(c)
     assert c.cell_styles() == _reference_styles(c)
+
+
+def test_cell_styles_match_a_naive_per_cell_reference():
+    """The fast style computation must agree with a per-cell maximum."""
+    rng = random.Random(31337)
+    c = Canvas(24, 16)
+    for _ in range(300):
+        c.set(rng.randrange(c.width), rng.randrange(c.height), rng.randrange(1, 8))
+    styles = c.cell_styles()
+    # The canvas really holds several different styles.
+    assert len({value for row in styles for value in row}) >= 4
+    assert styles == _naive_cell_styles(c)
 
 
 def test_large_canvas_is_consistent():
