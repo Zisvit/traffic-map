@@ -13,6 +13,11 @@ reach the map.  The list of networks is explicit on purpose:
 where Tailscale lives) differently from release to release, and this
 module has to count it as local.
 
+An IPv4-mapped IPv6 address (``::ffff:8.8.8.8``) is an IPv4 address in
+disguise, and it is treated as one everywhere: it is classified as
+local or public like the address it hides, and the databases are asked
+about the address it hides too.
+
 Databases
 ---------
 DB-IP Lite is the default, but the reader does not care about the
@@ -21,13 +26,23 @@ vendor.  The field names of GeoLite2 (``location.latitude``,
 same, so a swapped-in GeoLite2 file keeps working.  A field that is
 missing simply leaves its value empty.
 
+The cache
+---------
+The place of an address is kept in memory.  A lock guards the cache:
+the collector thread fills it while the user interface reads it.  The
+lock is never held while a database is read, so a slow lookup does not
+block the other threads.
+
 The anchor
 ----------
 The anchor is our own address on the map.  Its IP is asked from
 ``api.ipify.org`` (``ifconfig.me/ip`` as a fallback) and cached in
 ``<cache dir>/anchor.json`` for an hour, so the app starts without a
-network round trip.  Every network failure is swallowed: the anchor is
-a convenience, and the map works without it.
+network round trip.  The whole search has a deadline of
+:data:`HTTP_TIMEOUT` seconds: a service that answers late is of no use
+to a program that draws a map.  The cache file is checked before it is
+used, a broken one is ignored.  Every network failure is swallowed: the
+anchor is a convenience, and the map works without it.
 """
 
 from __future__ import annotations
@@ -36,13 +51,17 @@ import http.client
 import ipaddress
 import json
 import logging
+import math
 import os
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 import maxminddb
 
@@ -79,8 +98,18 @@ PUBLIC_IP_URLS = ("https://api.ipify.org", "https://ifconfig.me/ip")
 #: Seconds an anchor stays valid in the cache file.
 ANCHOR_TTL = 3600.0
 
-#: Seconds a single HTTP request may take.
+#: Seconds the whole search for the public address may take.
 HTTP_TIMEOUT = 2.0
+
+#: Smallest timeout given to a request, so a nearly spent budget still
+#: tries the service instead of giving up right away.
+MIN_HTTP_TIMEOUT = 0.1
+
+#: Range of a latitude.
+LAT_RANGE = (-90.0, 90.0)
+
+#: Range of a longitude.
+LON_RANGE = (-180.0, 180.0)
 
 #: Maximum number of addresses kept in the in-memory cache.
 CACHE_LIMIT = 4096
@@ -120,13 +149,54 @@ def is_local(ip: str) -> bool:
         unspecified ranges, and also for a malformed address, which is
         unusable anyway.
     """
-    try:
-        address = ipaddress.ip_address(ip.strip())
-    except (AttributeError, ValueError):
+    address = _parse_address(ip.strip() if isinstance(ip, str) else str(ip))
+    if address is None:
         return True
+    return _in_local_net(_unmap(address))
+
+
+def _parse_address(text: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Return the address a text holds, or ``None`` when it holds none."""
+    try:
+        return ipaddress.ip_address(text)
+    except ValueError:
+        return None
+
+
+def _unmap(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    """Return the IPv4 address hidden in an IPv4-mapped IPv6 address."""
     if address.version == 6 and address.ipv4_mapped is not None:
-        address = address.ipv4_mapped
+        return address.ipv4_mapped
+    return address
+
+
+def _in_local_net(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
+    """Tell whether an address belongs to one of the local networks."""
     return any(address in network for network in LOCAL_NETS)
+
+
+def _normalize(ip: str) -> str:
+    """Return the text of an address, with IPv4-mapped IPv6 unmapped.
+
+    Args:
+        ip: The address to normalize.
+
+    Returns:
+        The IPv4 address an IPv4-mapped IPv6 address hides, and the text
+        itself for every other address.  A text that is not an address is
+        kept as it is.
+    """
+    text = ip.strip() if isinstance(ip, str) else str(ip)
+    address = _parse_address(text)
+    if address is None:
+        return text
+    if address.version == 6 and address.ipv4_mapped is not None:
+        return str(address.ipv4_mapped)
+    return text
 
 
 class GeoResolver:
@@ -157,7 +227,8 @@ class GeoResolver:
             if asn_path.exists():
                 self._asn = _open_database(asn_path, "asn")
         self._cache_dir = Path(cache_dir) if cache_dir is not None else None
-        self._cache: dict[str, Geo] = {}
+        self._cache: OrderedDict[str, Geo] = OrderedDict()
+        self._cache_lock = threading.Lock()
 
     def lookup(self, ip: str) -> Geo:
         """Resolve one address to its place.
@@ -171,22 +242,46 @@ class GeoResolver:
             databases gets no coordinates either, but keeps its ASN
             when the ASN database knows it.
         """
-        key = ip.strip() if isinstance(ip, str) else str(ip)
-        cached = self._cache.pop(key, None)
+        key = _normalize(ip)
+
+        cached = self._cache_get(key)
         if cached is not None:
-            # Re-insert to mark the entry as the most recently used one.
-            self._cache[key] = cached
             return cached
 
-        if is_local(key):
+        address = _parse_address(key)
+        if address is None or _in_local_net(address):
             geo = Geo(key, None, None, UNKNOWN_COUNTRY, None, None, None)
         else:
+            # The databases are read without the lock, a lookup of a
+            # single address must not hold up the other threads.
             geo = self._lookup_public(key)
 
-        self._cache[key] = geo
-        while len(self._cache) > CACHE_LIMIT:
-            del self._cache[next(iter(self._cache))]
+        self._cache_put(key, geo)
         return geo
+
+    def _cache_get(self, key: str) -> Geo | None:
+        """Return the cached place of an address, if there is one.
+
+        The entry is marked as the most recently used one, so the oldest
+        one is the first to go when the cache is full.
+        """
+        with self._cache_lock:
+            geo = self._cache.get(key)
+            if geo is not None:
+                self._cache.move_to_end(key)
+            return geo
+
+    def _cache_put(self, key: str, geo: Geo) -> None:
+        """Store the place of an address and keep the cache bounded."""
+        with self._cache_lock:
+            self._cache[key] = geo
+            self._cache.move_to_end(key)
+            while len(self._cache) > CACHE_LIMIT:
+                try:
+                    self._cache.popitem(last=False)
+                except KeyError:
+                    # Another thread emptied the cache, nothing to evict.
+                    break
 
     def anchor(self) -> Geo | None:
         """Resolve the public address of this machine.
@@ -198,12 +293,14 @@ class GeoResolver:
             The place of this machine, or ``None`` when the address
             cannot be found.  No network or parse error is raised.
         """
+        deadline = time.monotonic() + HTTP_TIMEOUT
+
         cached = self._read_anchor_cache()
         if cached is not None:
             log.debug("anchor from cache: %s", cached.ip)
             return cached
 
-        ip = _fetch_public_ip()
+        ip = _fetch_public_ip(deadline=deadline)
         if ip is None:
             log.debug("cannot resolve the public address")
             return None
@@ -282,22 +379,19 @@ class GeoResolver:
             return None
 
         expires_at = data.get("expires_at")
-        if not isinstance(expires_at, (int, float)) or expires_at <= time.time():
+        if (
+            isinstance(expires_at, bool)
+            or not isinstance(expires_at, (int, float))
+            or not math.isfinite(expires_at)
+            or expires_at <= time.time()
+        ):
             log.debug("the anchor cache %s is expired", path)
             return None
 
-        country = data.get("country")
-        return Geo(
-            ip=str(data.get("ip") or ""),
-            lat=_as_float(data.get("lat")),
-            lon=_as_float(data.get("lon")),
-            country=country
-            if isinstance(country, str) and country
-            else UNKNOWN_COUNTRY,
-            city=_as_optional_str(data.get("city")),
-            asn=_as_int(data.get("asn")),
-            org=_as_optional_str(data.get("org")),
-        )
+        geo = _anchor_from_payload(data)
+        if geo is None:
+            log.debug("the anchor cache %s holds broken data", path)
+        return geo
 
     def _write_anchor_cache(self, geo: Geo) -> None:
         """Store the anchor in the cache file."""
@@ -361,22 +455,37 @@ def _open_database(path: Path, kind: str) -> maxminddb.Reader:
         raise ValueError(f"{kind} database {path} cannot be read: {exc}") from exc
 
 
-def _fetch_public_ip(timeout: float = HTTP_TIMEOUT) -> str | None:
+def _fetch_public_ip(
+    timeout: float | None = None, deadline: float | None = None
+) -> str | None:
     """Ask a service for the public address of this machine.
 
+    The whole search has one budget, not one per request: a service that
+    answers late is of no use, and the next one has to be asked right
+    away.
+
     Args:
-        timeout: Seconds a single request may take.
+        timeout: Seconds the whole search may take.  It is
+            :data:`HTTP_TIMEOUT` when it is missing.
+        deadline: Moment the search has to end, counted the way
+            :func:`time.monotonic` counts.  It is computed from
+            ``timeout`` when it is missing.
 
     Returns:
-        The address, or ``None`` when every service failed.
+        The address, or ``None`` when every service failed or the budget
+        ran out.
     """
+    if deadline is None:
+        if timeout is None:
+            timeout = HTTP_TIMEOUT
+        deadline = time.monotonic() + timeout
+
     for url in PUBLIC_IP_URLS:
-        request = urllib.request.Request(
-            url, headers={"User-Agent": "trafficmap/0.1 (+https://example.invalid)"}
-        )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                raw = response.read(64).decode("utf-8", "replace")
+            candidate = _call_before(deadline, _public_ip_from, url, deadline)
+        except TimeoutError as exc:
+            log.debug("public address from %s did not arrive in time: %s", url, exc)
+            return None
         except (
             urllib.error.URLError,
             http.client.HTTPException,
@@ -385,14 +494,182 @@ def _fetch_public_ip(timeout: float = HTTP_TIMEOUT) -> str | None:
         ) as exc:
             log.debug("public address from %s failed: %s", url, exc)
             continue
-        candidate = raw.strip()
-        try:
-            ipaddress.ip_address(candidate)
-        except ValueError:
-            log.debug("public address from %s is not an address: %r", url, candidate)
+        if candidate is None:
             continue
         return candidate
     return None
+
+
+def _public_ip_from(url: str, deadline: float) -> str | None:
+    """Ask one service for the public address, within the deadline.
+
+    Args:
+        url: Address of the service.
+        deadline: Moment the request has to end.
+
+    Returns:
+        The address, or ``None`` when the service failed or answered
+        something that is not an address.
+    """
+    remaining = deadline - time.monotonic()
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "trafficmap/0.1 (+https://example.invalid)"}
+    )
+    try:
+        with urllib.request.urlopen(
+            request, timeout=max(MIN_HTTP_TIMEOUT, remaining)
+        ) as response:
+            # The timeout of a socket covers one operation, not the whole
+            # answer, so the rest of the budget is given to the body.
+            _set_socket_timeout(response, deadline - time.monotonic())
+            raw = response.read(64).decode("utf-8", "replace")
+    except (
+        urllib.error.URLError,
+        http.client.HTTPException,
+        OSError,
+        ValueError,
+    ) as exc:
+        log.debug("public address from %s failed: %s", url, exc)
+        return None
+    candidate = raw.strip()
+    try:
+        ipaddress.ip_address(candidate)
+    except ValueError:
+        log.debug("public address from %s is not an address: %r", url, candidate)
+        return None
+    return candidate
+
+
+def _call_before(deadline: float, function: Callable[..., Any], *args: Any) -> Any:
+    """Run a function and stop waiting for it at the deadline.
+
+    The function may block in a way no timeout covers, a name lookup
+    that never ends for example.  It runs in a helper thread, so the
+    wait for it stays bounded.
+
+    Args:
+        deadline: Moment the call has to end.
+        function: The function to run.
+        args: The arguments of the function.
+
+    Returns:
+        Whatever the function returned.
+
+    Raises:
+        TimeoutError: When the deadline passed before the call ended.
+        BaseException: Whatever the function raised.
+    """
+    outcome: list[Any] = []
+
+    def worker() -> None:
+        try:
+            outcome.append(function(*args))
+        except BaseException as exc:  # noqa: BLE001 - handed to the caller
+            outcome.append(exc)
+
+    thread = threading.Thread(target=worker, name="trafficmap-anchor", daemon=True)
+    thread.start()
+    thread.join(max(0.0, deadline - time.monotonic()))
+    if thread.is_alive():
+        raise TimeoutError("the deadline passed")
+    result = outcome[0]
+    if isinstance(result, BaseException):
+        raise result
+    return result
+
+
+def _set_socket_timeout(response: object, seconds: float) -> None:
+    """Set the timeout of the socket of a response, when it has one.
+
+    Args:
+        response: The response to look at.
+        seconds: The timeout the socket gets.
+    """
+    if seconds <= 0:
+        seconds = MIN_HTTP_TIMEOUT
+    stream = getattr(response, "fp", None)
+    raw = getattr(stream, "raw", None)
+    for sock in (
+        getattr(raw, "_sock", None),
+        getattr(stream, "_sock", None),
+        raw,
+    ):
+        settimeout = getattr(sock, "settimeout", None)
+        if settimeout is None:
+            continue
+        try:
+            settimeout(seconds)
+            return
+        except (OSError, ValueError) as exc:
+            log.debug("cannot set the timeout of the socket: %s", exc)
+
+
+def _anchor_from_payload(data: dict) -> Geo | None:
+    """Build the anchor of a cache file, or ``None`` when it is broken.
+
+    A hand-edited file may hold anything, and a broken coordinate puts
+    the map in the middle of the ocean.
+
+    Args:
+        data: The content of the cache file.
+
+    Returns:
+        The anchor, or ``None`` when the content is not a usable one.
+    """
+    ip = data.get("ip")
+    if not isinstance(ip, str):
+        return None
+    ip = ip.strip()
+    if _parse_address(ip) is None:
+        return None
+
+    try:
+        lat = _coordinate(data.get("lat"), LAT_RANGE)
+        lon = _coordinate(data.get("lon"), LON_RANGE)
+    except ValueError as exc:
+        log.debug("broken anchor cache: %s", exc)
+        return None
+
+    country = data.get("country", UNKNOWN_COUNTRY)
+    if not isinstance(country, str):
+        log.debug("broken anchor cache: the country is not a text")
+        return None
+
+    return Geo(
+        ip=ip,
+        lat=lat,
+        lon=lon,
+        country=country or UNKNOWN_COUNTRY,
+        city=_as_optional_str(data.get("city")),
+        asn=_as_int(data.get("asn")),
+        org=_as_optional_str(data.get("org")),
+    )
+
+
+def _coordinate(value: object, limits: tuple[float, float]) -> float | None:
+    """Return a coordinate of the cache file, or ``None`` when it has none.
+
+    Args:
+        value: The value of the coordinate.
+        limits: The lowest and the highest value it may have.
+
+    Returns:
+        The coordinate, or ``None`` when the file holds none.
+
+    Raises:
+        ValueError: When the value is not a usable coordinate.
+    """
+    if value is None:
+        return None
+    number = _as_float(value)
+    if number is None:
+        raise ValueError(f"not a number: {value!r}")
+    if not math.isfinite(number):
+        raise ValueError(f"not a finite number: {value!r}")
+    low, high = limits
+    if not (low <= number <= high):
+        raise ValueError(f"out of range: {number!r}")
+    return number
 
 
 def _record(reader: maxminddb.Reader | None, ip: str) -> dict | None:

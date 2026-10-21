@@ -5,6 +5,7 @@ and the databases are either the downloaded ones or a stand-in reader.
 """
 
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -339,10 +340,12 @@ def test_anchor_cache_roundtrip(tmp_path, monkeypatch):
 def test_anchor_without_a_cache_dir_does_not_write_a_file(tmp_path, monkeypatch):
     monkeypatch.setattr(geo, "_open_database", lambda path, kind: FakeReader({}))
     monkeypatch.setattr(geo, "_fetch_public_ip", lambda *args, **kwargs: "203.0.113.9")
+    # The resolver must not write anything next to the working directory.
+    monkeypatch.chdir(tmp_path)
 
     resolver = GeoResolver(CITY_DB, ASN_DB, None)
     assert resolver.anchor() is not None
-    assert not (tmp_path / "anchor.json").exists()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_anchor_returns_none_when_the_network_fails(tmp_path, monkeypatch):
@@ -452,3 +455,193 @@ def test_real_database_asn_lookup():
     geo_ = resolver.lookup("8.8.8.8")
     assert geo_.asn == 15169
     assert geo_.org == "Google LLC"
+
+
+def public_ip(number):
+    """Return a distinct public address for a number.
+
+    The addresses come from the benchmark range 198.18.0.0/15, they are
+    not local and not in the databases either.
+    """
+    return f"198.{18 + number // 65536}.{number // 256 % 256}.{number % 256}"
+
+
+def test_the_module_constants():
+    assert geo.HTTP_TIMEOUT == 2.0
+    assert geo.ANCHOR_TTL == 3600
+
+
+def test_an_ipv4_mapped_address_is_local():
+    assert is_local("::ffff:127.0.0.1")
+
+
+def test_an_ipv4_mapped_address_is_looked_up_as_ipv4(monkeypatch, tmp_path):
+    resolver, city_reader, asn_reader, _ = make_resolver(
+        monkeypatch,
+        tmp_path,
+        city={"8.8.8.8": CITY_RECORD},
+        asn={"8.8.8.8": ASN_RECORD},
+    )
+
+    mapped = resolver.lookup("::ffff:8.8.8.8")
+    plain = resolver.lookup("8.8.8.8")
+
+    assert mapped == plain
+    assert mapped.country == "US"
+    # The databases are asked about the address the mapped one hides.
+    assert city_reader.asked == ["8.8.8.8"]
+    assert asn_reader.asked == ["8.8.8.8"]
+
+
+def test_anchor_cache_roundtrip_keeps_the_coordinates(tmp_path, monkeypatch):
+    resolver, _, _, _ = make_resolver(
+        monkeypatch,
+        tmp_path,
+        city={"203.0.113.9": CITY_RECORD},
+    )
+    monkeypatch.setattr(geo, "_fetch_public_ip", lambda *args, **kwargs: "203.0.113.9")
+
+    first = resolver.anchor()
+    assert (first.lat, first.lon) == (37.422, -122.085)
+
+    cache = json.loads((tmp_path / "anchor.json").read_text(encoding="utf-8"))
+    assert cache["lat"] == 37.422
+    assert cache["lon"] == -122.085
+
+    no_network(monkeypatch)
+    second = GeoResolver(CITY_DB, ASN_DB, tmp_path).anchor()
+    assert second == first
+    assert (second.lat, second.lon) == (37.422, -122.085)
+    # The two coordinates differ, a swap cannot pass unnoticed.
+    assert second.lat != second.lon
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"ip": "203.0.113.9", "lat": float("nan"), "lon": 20.0},
+        {"ip": "203.0.113.9", "lat": 10.0, "lon": float("inf")},
+        {"ip": "203.0.113.9", "lat": 999.0, "lon": 20.0},
+        {"ip": "203.0.113.9", "lat": 10.0, "lon": 999.0},
+        {"ip": "not-an-ip", "lat": 10.0, "lon": 20.0},
+    ],
+)
+def test_a_broken_anchor_cache_is_ignored(tmp_path, monkeypatch, entry):
+    monkeypatch.setattr(geo, "_open_database", lambda path, kind: FakeReader({}))
+    failing_network(monkeypatch)
+    payload = dict(entry)
+    payload["country"] = "US"
+    payload["expires_at"] = time.time() + 600
+    (tmp_path / "anchor.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    resolver = GeoResolver(CITY_DB, ASN_DB, tmp_path)
+    assert resolver.anchor() is None
+
+
+def test_an_anchor_cache_without_a_country_is_ignored(tmp_path, monkeypatch):
+    monkeypatch.setattr(geo, "_open_database", lambda path, kind: FakeReader({}))
+    failing_network(monkeypatch)
+    (tmp_path / "anchor.json").write_text(
+        json.dumps(
+            {
+                "ip": "203.0.113.9",
+                "lat": 10.0,
+                "lon": 20.0,
+                "country": 42,
+                "expires_at": time.time() + 600,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolver = GeoResolver(CITY_DB, ASN_DB, tmp_path)
+    assert resolver.anchor() is None
+
+
+def test_the_cache_stays_bounded(monkeypatch, tmp_path):
+    resolver, _, _, _ = make_resolver(monkeypatch, tmp_path)
+
+    for number in range(geo.CACHE_LIMIT + 100):
+        resolver.lookup(public_ip(number))
+
+    assert len(resolver._cache) <= geo.CACHE_LIMIT
+
+
+def test_the_cache_is_safe_to_use_from_many_threads(monkeypatch, tmp_path):
+    resolver, _, _, _ = make_resolver(monkeypatch, tmp_path)
+    errors = []
+    threads_count = 4
+    lookups = 4000
+
+    def worker(index):
+        try:
+            for number in range(lookups):
+                resolver.lookup(public_ip(index * lookups + number))
+                # A hit as well, the cache is written while it is read.
+                resolver.lookup("8.8.8.8")
+        except BaseException as exc:  # noqa: BLE001 - the test reports it
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=worker, args=(index,)) for index in range(threads_count)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+
+    assert errors == []
+    assert len(resolver._cache) <= geo.CACHE_LIMIT
+
+
+def test_the_anchor_search_has_one_budget(monkeypatch, tmp_path):
+    monkeypatch.setattr(geo, "_open_database", lambda path, kind: FakeReader({}))
+
+    def slow_urlopen(request, timeout=None):
+        time.sleep(5)
+        raise OSError("too late")
+
+    monkeypatch.setattr(geo.urllib.request, "urlopen", slow_urlopen)
+
+    resolver = GeoResolver(CITY_DB, ASN_DB, tmp_path)
+    start = time.monotonic()
+    assert resolver.anchor() is None
+    assert time.monotonic() - start < 2.2
+
+
+def test_the_body_is_read_with_the_rest_of_the_budget(monkeypatch):
+    class FakeSocket:
+        def __init__(self):
+            self.timeout = None
+
+        def settimeout(self, value):
+            self.timeout = value
+
+    class FakeRaw:
+        def __init__(self, sock):
+            self._sock = sock
+
+    class FakeStream:
+        def __init__(self, sock):
+            self.raw = FakeRaw(sock)
+
+    class Response:
+        def __init__(self):
+            self.sock = FakeSocket()
+            self.fp = FakeStream(self.sock)
+
+        def read(self, size=0):
+            return b"203.0.113.9"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    response = Response()
+    monkeypatch.setattr(geo.urllib.request, "urlopen", lambda *a, **k: response)
+
+    assert geo._fetch_public_ip() == "203.0.113.9"
+    assert response.sock.timeout is not None
+    assert 0 < response.sock.timeout <= geo.HTTP_TIMEOUT
