@@ -147,6 +147,33 @@ def test_land_fraction_with_real_asset():
     assert mask[_index(-150.0, 0.0, width, height)] == 0
 
 
+@pytest.mark.skipif(not REAL_LAND.exists(), reason="assets/land.geojson is missing")
+def test_the_caspian_is_the_only_hole_and_is_painted_as_land():
+    """The dataset has one hole, the Caspian Sea, and it is painted as land."""
+    geojson = _load(REAL_LAND)
+    holes = []
+    for feature in geojson["features"]:
+        geometry = feature.get("geometry") or {}
+        coordinates = geometry.get("coordinates")
+        if geometry.get("type") == "Polygon":
+            polygons = [coordinates]
+        elif geometry.get("type") == "MultiPolygon":
+            polygons = coordinates
+        else:
+            continue
+        for polygon in polygons:
+            if len(polygon) > 1:
+                holes.append(polygon[1])
+    assert len(holes) == 1
+    hole = holes[0]
+
+    width, height = 400, 240
+    mask = rasterize(geojson, width, height)
+    # The coastline of the hole lies inside the Eurasia polygon, and holes
+    # are not subtracted: the Caspian is part of the land mask.
+    assert all(mask[_index(lon, lat, width, height)] == 1 for lon, lat in hole)
+
+
 def test_cache_roundtrip(tmp_path):
     """The second call is served from the cache and does not rewrite it."""
     first = load_land(tmp_path, SAMPLE, WIDTH, HEIGHT)
@@ -175,3 +202,35 @@ def test_cache_file_is_created_in_a_missing_directory(tmp_path):
     mask = load_land(cache_dir, SAMPLE, WIDTH, HEIGHT)
     assert len(mask) == WIDTH * HEIGHT
     assert list(cache_dir.glob("land_*.bin"))
+
+
+def test_a_broken_cache_file_is_rasterized_again(tmp_path):
+    """A file of the right length with a broken content is a cache miss."""
+    mask = load_land(tmp_path, SAMPLE, WIDTH, HEIGHT)
+    cache_file = tmp_path / f"land_{WIDTH}x{HEIGHT}_{SAMPLE.stat().st_mtime_ns}.bin"
+    cache_file.write_bytes(b"\x02" * (WIDTH * HEIGHT))
+
+    again = load_land(tmp_path, SAMPLE, WIDTH, HEIGHT)
+    assert again == mask
+    # The cache file was rewritten with a valid mask.
+    assert set(cache_file.read_bytes()) <= {0, 1}
+
+
+def test_stale_cache_files_are_removed(tmp_path):
+    """A cache file of an older dataset does not stay in the cache."""
+    mask = load_land(tmp_path, SAMPLE, WIDTH, HEIGHT)
+    current = tmp_path / f"land_{WIDTH}x{HEIGHT}_{SAMPLE.stat().st_mtime_ns}.bin"
+    stale = tmp_path / f"land_{WIDTH}x{HEIGHT}_1.bin"
+    stale.write_bytes(bytes(WIDTH * HEIGHT))
+    other = tmp_path / f"land_{WIDTH * 2}x{HEIGHT * 2}_1.bin"
+    other.write_bytes(bytes(WIDTH * 2 * HEIGHT * 2))
+
+    # Drop the current file, so that the mask is written again.
+    current.unlink()
+    again = load_land(tmp_path, SAMPLE, WIDTH, HEIGHT)
+
+    assert again == mask
+    assert not stale.exists()
+    assert current.exists()
+    # The cache of another resolution is still in use.
+    assert other.exists()

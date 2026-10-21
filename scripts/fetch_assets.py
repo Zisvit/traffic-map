@@ -10,7 +10,8 @@ Three files are fetched into the ``assets`` directory of the repository:
 
 The DB-IP databases are published per month.  The script asks for the
 current month and falls back to older months while the server answers with
-HTTP 404, at most three months back.
+HTTP 403, 404 or 410 (DB-IP answers 403 for a month that has not been
+published yet), at most three months back.
 
 Only the standard library is used.  An asset that already exists and passes
 validation is kept, so the script can be re-run safely; ``--force``
@@ -22,8 +23,11 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import http.client
 import json
+import os
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -39,6 +43,10 @@ USER_AGENT = "trafficmap-asset-fetcher/0.1 (offline map assets; python-urllib)"
 
 #: How many months back a monthly database is looked up.
 MONTHS_BACK = 3
+
+#: HTTP statuses that mean "this publication is not available (yet)".
+#: DB-IP answers 403 for a month that has not been published yet.
+MISSING_PUBLICATION_STATUSES = frozenset({403, 404, 410})
 
 #: Marker bytes of the metadata section of every MaxMind DB file.
 MMDB_MARKER = b"\xab\xcd\xefMaxMind.com"
@@ -186,8 +194,8 @@ def fetch(url: str) -> bytes:
         The response body.
 
     Raises:
-        AssetError: If the request fails or the server answers with an
-            error status.
+        AssetError: If the request fails, the server answers with an
+            error status or the transfer is cut short.
     """
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
@@ -195,12 +203,22 @@ def fetch(url: str) -> bytes:
             return response.read()
     except urllib.error.HTTPError as exc:
         raise AssetError(f"HTTP {exc.code} for {url}", status=exc.code) from exc
+    except http.client.HTTPException as exc:
+        # An incomplete transfer: the server closed the connection or the
+        # body was shorter than announced.  This is not an OSError, so it
+        # would escape the error handling of main() without this clause.
+        detail = str(exc) or exc.__class__.__name__
+        raise AssetError(f"incomplete transfer of {url}: {detail}") from exc
     except (urllib.error.URLError, OSError) as exc:
         raise AssetError(f"cannot fetch {url}: {exc}") from exc
 
 
 def download(asset: Asset) -> tuple[str, bytes]:
     """Download an asset, falling back to older months when needed.
+
+    A monthly publication that is not available yet is looked up in the
+    older months, as long as the server answers with one of the statuses
+    in :data:`MISSING_PUBLICATION_STATUSES`.
 
     Args:
         asset: The asset to download.
@@ -221,7 +239,7 @@ def download(asset: Asset) -> tuple[str, bytes]:
         except AssetError as exc:
             # Only a missing publication is worth retrying with an older
             # month; every other error is a real failure.
-            if exc.status != 404:
+            if exc.status not in MISSING_PUBLICATION_STATUSES:
                 raise
             missing.append(label)
     raise AssetError(
@@ -263,7 +281,8 @@ def fetch_asset(asset: Asset, dest: Path, force: bool = False) -> str:
         A one line description of what happened.
 
     Raises:
-        AssetError: If the asset could not be downloaded or validated.
+        AssetError: If the asset could not be downloaded, written or
+            validated.
     """
     if dest.exists() and not force:
         try:
@@ -276,8 +295,40 @@ def fetch_asset(asset: Asset, dest: Path, force: bool = False) -> str:
     url, payload = download(asset)
     data = decompress(payload) if asset.compressed else payload
     asset.validate(data)
-    dest.write_bytes(data)
+    try:
+        _write_atomic(dest, data)
+    except OSError as exc:
+        raise AssetError(f"cannot write {dest}: {exc}") from exc
     return f"{asset.name}: {len(data)} bytes <- {url}"
+
+
+def _write_atomic(dest: Path, data: bytes) -> None:
+    """Write the payload to the destination file, atomically.
+
+    The bytes go to a temporary file in the same directory and are moved
+    into place with :func:`os.replace`, so a reader never sees a half
+    written file.
+
+    Args:
+        dest: Path of the file to write.
+        data: The bytes to store.
+
+    Raises:
+        OSError: If the file cannot be written.
+    """
+    handle = tempfile.NamedTemporaryFile(
+        dir=dest.parent,
+        prefix=f".{dest.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    try:
+        with handle:
+            handle.write(data)
+        os.replace(handle.name, dest)
+    except BaseException:
+        Path(handle.name).unlink(missing_ok=True)
+        raise
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

@@ -23,13 +23,16 @@ Rasterizing is not cheap, and the resolution of the mask is known only at
 runtime.  :func:`load_land` therefore keeps the raster on disk under
 ``land_{width}x{height}_{mtime_ns}.bin``; the modification time of the
 GeoJSON file is part of the name, so a newer dataset never reuses the
-raster of an older one.
+raster of an older one.  When a new raster is written, the files of the
+same resolution with another timestamp are removed, so the cache does not
+grow without bound.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -44,8 +47,10 @@ _TO_BIT = bytes(1 if value else 0 for value in range(256))
 def rasterize(geojson: dict, width: int, height: int) -> bytearray:
     """Rasterize the land polygons of a GeoJSON document.
 
-    Only the outer ring of a polygon is filled; holes are ignored, which
-    is harmless for the 110m dataset (its polygons have no holes at all).
+    Only the outer ring of a polygon is filled; interior holes are
+    ignored.  The 110m dataset has exactly one hole, the Caspian Sea
+    (the inner ring of feature 112), so the Caspian is painted as land:
+    82 pixels of a 400x240 mask.
 
     Args:
         geojson: GeoJSON document: a ``FeatureCollection`` or a single
@@ -111,6 +116,7 @@ def load_land(
         geojson = json.load(handle)
     mask = rasterize(geojson, width, height)
     _write_cache(cache_file, mask)
+    _prune_cache(cache_dir, width, height, cache_file)
     return mask
 
 
@@ -183,6 +189,11 @@ def _to_pixel(lon: float, lat: float, width: int, height: int) -> tuple[int, int
 def _read_cache(cache_file: Path, size: int) -> bytearray | None:
     """Return the cached mask, if it is usable.
 
+    The file is only accepted when it has the expected length and holds
+    nothing but the byte values 0 and 1.  A file of the right length
+    with a broken content is treated as a cache miss and rasterized
+    again.
+
     Args:
         cache_file: Path of the cache file.
         size: Expected number of bytes.
@@ -196,7 +207,35 @@ def _read_cache(cache_file: Path, size: int) -> bytearray | None:
         return None
     if len(data) != size:
         return None
+    if not set(data) <= {0, 1}:
+        return None
     return bytearray(data)
+
+
+def _prune_cache(cache_dir: Path, width: int, height: int, keep: Path) -> None:
+    """Remove the cache files of one resolution that are no longer used.
+
+    The name of a cache file holds the modification time of the GeoJSON
+    file, so a newer dataset leaves the file of the older one behind.
+    Only the files of the same resolution are removed; the file of
+    another resolution is still in use.
+
+    Args:
+        cache_dir: Directory the raster is cached in.
+        width: Width of the mask in pixels.
+        height: Height of the mask in pixels.
+        keep: Path of the cache file that has to survive.
+    """
+    for path in cache_dir.glob(f"land_{width}x{height}_*.bin"):
+        if path == keep:
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            print(
+                f"warning: cannot remove the stale cache file {path}: {exc}",
+                file=sys.stderr,
+            )
 
 
 def _write_cache(cache_file: Path, mask: bytearray) -> None:
