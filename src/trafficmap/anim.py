@@ -122,7 +122,12 @@ TRAIL_LENGTH = 12
 MAX_COMETS = 200
 
 #: Number of samples of the great circle a comet flies along.
-PATH_SAMPLES = 48
+#:
+#: The samples are the points the head of the comet walks through, so
+#: there must be enough of them for the head to move about one dot per
+#: frame: a coarse path makes the comet hop over the map instead of
+#: sliding over it.
+PATH_SAMPLES = 160
 
 
 class Comet:
@@ -440,23 +445,47 @@ class Animator:
             canvas.set(point[0], point[1], STYLE_PEER)
 
     def _draw_comets(self, canvas: Canvas, viewport: Viewport, now: float) -> None:
-        """Draw every comet that is alive: its tail and its head."""
+        """Draw every comet that is alive: its tail and its head.
+
+        The tail is a streak, not a row of dots: the points that are
+        left behind are joined with a line, so that a route that is
+        longer than the tail keeps a continuous trail.  A point that
+        falls outside the viewport breaks the streak: the line is not
+        drawn across the screen.
+        """
         for comet in self._comets:
             if comet.expired(now):
                 continue
             # The last point of the trail is the head: it is painted
             # with the style of the head, not with the style of the
             # tail.
-            tail = comet.trail(now, self.trail_length)[:-1]
+            points = comet.trail(now, self.trail_length)
+            if not points:
+                continue
+            tail = points[:-1]
+            previous: tuple[int, int] | None = None
+            previous_style = STYLE_TRAIL_DIM
             for index, (lat, lon) in enumerate(tail):
+                style = _trail_style(index, len(tail))
                 point = project(lat, lon, viewport)
                 if point is None:
+                    previous = None
                     continue
-                canvas.set(point[0], point[1], _trail_style(index, len(tail)))
-            lat, lon = comet.head(now)
+                if previous is not None:
+                    canvas.line(
+                        previous[0], previous[1], point[0], point[1], previous_style
+                    )
+                canvas.set(point[0], point[1], style)
+                previous = point
+                previous_style = style
+            lat, lon = points[-1]
             point = project(lat, lon, viewport)
             if point is None:
                 continue
+            if previous is not None:
+                canvas.line(
+                    previous[0], previous[1], point[0], point[1], STYLE_TRAIL_BRIGHT
+                )
             canvas.set(point[0], point[1], STYLE_COMET_HEAD)
 
     def _touch_peer(self, flow: Flow, now: float) -> None:
