@@ -230,12 +230,16 @@ def test_great_circle_endpoints():
     assert len(pts) == 32
     assert abs(pts[0][0] - 55.75) < 1e-6 and abs(pts[-1][1] + 74.0) < 1e-6
     mid = pts[16]
-    assert 45 < mid[0] < 62 and -45 < mid[1] < -20   # над Атлантикой
+    assert 55 < mid[0] < 70 and -40 < mid[1] < -20   # над Атлантикой
 
 def test_antipodes_do_not_crash():
     pts = great_circle((0, 0), (0, 180), 10)
     assert len(pts) == 10 and all(-90 <= la <= 90 for la, _ in pts)
 ```
+
+Конвенция индексов: `x = int((dlon + lon_span/2) / lon_span * (width - 1) + 0.5)`,
+`y = int((lat_span/2 - (lat - center_lat)) / lat_span * (height - 1) + 0.5)`,
+с клампом в `[0, width-1]` / `[0, height-1]`. `dlon` нормализуется в `[-180, 180]`.
 
 - [ ] **Step 2: Реализовать** по формулам спеки (`project` — floor-индексы, клиппинг;
   `great_circle` — slerp, антиподы через ортогональную ось). `Viewport` получает

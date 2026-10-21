@@ -23,6 +23,11 @@ __all__ = ["Viewport", "project", "unproject", "great_circle"]
 # Angular tolerance for "the two points coincide" / "the two points are
 # antipodal" in the great-circle computation (radians).
 _EPS = 1e-9
+# Norm of the sum of the two unit vectors below which the points count as
+# antipodal. The sum norm is ~0 at opposition and ~2*cos(omega/2) elsewhere,
+# so it detects antipodal pairs without the precision loss of acos near pi.
+# 1e-6 corresponds to an angular error of ~5e-7 rad.
+_ANTIPODAL_EPS = 1e-6
 # Z component above which a point is treated as parallel to the north pole
 # axis, so a different auxiliary axis is used to build a great circle.
 _PARALLEL_EPS = 0.999
@@ -99,9 +104,11 @@ def unproject(x: int, y: int, vp: Viewport) -> tuple[float, float]:
         ``(lat, lon)`` in degrees.
 
     Raises:
-        ValueError: If the viewport is smaller than two cells in either
-            axis, which makes the mapping undefined.
+        ValueError: If the viewport has a non-positive size or span, or is
+            smaller than two cells in either axis, which makes the mapping
+            undefined.
     """
+    _check_viewport(vp)
     if vp.width < 2 or vp.height < 2:
         raise ValueError(
             f"viewport must be at least 2x2 cells, got {vp.width}x{vp.height}"
@@ -150,16 +157,24 @@ def great_circle(
     # acos(dot), which loses precision near 1.0.
     chord = math.sqrt(sum((x - y) ** 2 for x, y in zip(va, vb)))
     if omega < _EPS or chord < _EPS:
+        # Interpolate the short way around: a longitude delta of +350 degrees
+        # must sweep 10 degrees westwards, not 350 degrees eastwards.
+        dlon = (lon_b - lon_a + 180.0) % 360.0 - 180.0
         return [
             (
                 lat_a + (lat_b - lat_a) * (i / (n - 1)),
-                lon_a + (lon_b - lon_a) * (i / (n - 1)),
+                lon_a + dlon * (i / (n - 1)),
             )
             for i in range(n)
         ]
 
     sin_omega = math.sin(omega)
-    if abs(sin_omega) < _EPS:
+    # Near opposition acos loses precision: an exact antipode can yield
+    # omega = pi - 1.5e-8, whose sine is far above _EPS, and the slerp then
+    # cancels catastrophically. The norm of the vector sum is ~0 exactly at
+    # opposition and ~2*cos(omega/2) elsewhere, so it is a stable test.
+    sum_norm = math.sqrt(sum((x + y) ** 2 for x, y in zip(va, vb)))
+    if abs(sin_omega) < _EPS or sum_norm < _ANTIPODAL_EPS:
         return _antipodal_path(va, n)
 
     points: list[tuple[float, float]] = []
