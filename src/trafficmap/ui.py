@@ -426,6 +426,11 @@ class _Map:
     def viewport(self) -> Viewport:
         """Return the part of the world the canvas shows.
 
+        The view is centred on the anchor when there is one, but the
+        centre never leaves the range of the latitudes: a view that
+        hangs over the pole shows rows of nothing and cuts the other
+        pole off.
+
         Returns:
             The viewport, centred on the anchor when there is one.
         """
@@ -434,7 +439,7 @@ class _Map:
         center_lon = 0.0
         anchor = self.anchor
         if anchor is not None and anchor.lat is not None and anchor.lon is not None:
-            center_lat = anchor.lat
+            center_lat = _clamp_lat(anchor.lat, lat_span)
             center_lon = anchor.lon
         return Viewport(
             width=self.canvas.width,
@@ -493,6 +498,26 @@ class _Map:
             )
             self._world_size = size
         return self._world
+
+
+def _clamp_lat(center_lat: float, lat_span: float) -> float:
+    """Keep the centre of the view inside the range of the latitudes.
+
+    The latitudes stop at ninety degrees: a view that is centred higher
+    than that shows rows of nothing at the top and cuts the south pole
+    off.  The centre is moved to the closest place where the whole span
+    of the view fits in the world.  The anchor stays inside the view,
+    because it is a place of the world itself.
+
+    Args:
+        center_lat: The latitude the view is centred on.
+        lat_span: The span of the view, in degrees.
+
+    Returns:
+        The latitude of the centre of the view.
+    """
+    half = lat_span / 2
+    return max(-90.0 + half, min(90.0 - half, center_lat))
 
 
 def _shows_the_whole_world(viewport: Viewport) -> bool:
