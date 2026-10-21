@@ -1,6 +1,9 @@
 .venv/
 __pycache__/
 *.egg-info/
+build/
+dist/
+*.whl
 assets/*.mmdb
 assets/land.geojson
 .pytest_cache/
