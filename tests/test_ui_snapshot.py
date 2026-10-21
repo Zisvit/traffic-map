@@ -5,7 +5,9 @@ without curses, and the interface is asked for its answer when there is
 no terminal at all.
 """
 
+import logging
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -130,6 +132,39 @@ def test_snapshot_shows_the_rates(tmp_path):
     text = make_snapshot(tmp_path)
     assert "↑ 1.2 MB/s" in text
     assert "↓ 9.1 MB/s" in text
+
+
+def test_the_snapshot_shows_the_rate_of_every_flow(tmp_path):
+    """The busiest flows show their rate, not the bytes they carried."""
+    text = make_snapshot(tmp_path)
+    line = text.splitlines()[-2]
+    assert "firefox:443 ↓9.0 MB/s" in line
+    # The rate is not an amount of bytes.
+    assert "9.0M" not in line
+
+
+def test_the_verbose_option_sends_the_log_to_the_error_stream(monkeypatch, tmp_path):
+    """The verbose option turns the log on, and the log goes to stderr."""
+    calls = []
+    monkeypatch.setattr(logging, "basicConfig", lambda **kwargs: calls.append(kwargs))
+    code = main(
+        [
+            "--verbose",
+            "--mock",
+            str(FIXTURE),
+            "--snapshot",
+            str(snapshot_path(tmp_path)),
+            "--frames",
+            "5",
+            "--no-anchor",
+        ]
+    )
+    assert code == 0
+    assert calls
+    assert calls[0]["level"] == logging.INFO
+    # The map is on the terminal: the log must not go to the standard
+    # output.
+    assert calls[0]["stream"] is sys.stderr
 
 
 def test_snapshot_without_frames_still_writes_a_frame(tmp_path):

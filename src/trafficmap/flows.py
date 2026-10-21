@@ -29,9 +29,10 @@ even when they talk to different ports.  The address of the key is the
 *normalized* one, the address as the resolver knows it: an IPv4-mapped
 address (``::ffff:1.1.1.1``) and the address it hides (``1.1.1.1``) are
 one flow, and the closed records of the dump join the opened and the
-updated ones.  A flow keeps the port of the socket that opened it, and
-the list of the busiest flows names the *dominant* port of a flow, the
-port of the socket that carries the most bytes.
+updated ones.  The port of a flow is the *dominant* one: the port of
+the socket that carries the most bytes.  It follows the sockets of the
+flow, so the list of the busiest flows and the interface name a flow
+the same way.
 
 Local addresses
 ---------------
@@ -57,9 +58,11 @@ table).  The rules are these:
   the :class:`Updated` of the poll.  An event-driven user interface
   hears about the flow again.
 * A flow whose sockets are all gone for more than :data:`CLOSE_POLLS`
-  polls is removed from the table.  A :class:`Closed` event is sent for
-  it, unless it was already closed when it went out of sight: a flow is
-  closed once and once only.
+  polls is removed from the table.  The deadline of that removal is the
+  *real* time of those polls, the same time the rates are computed
+  with, so a slow ``ss`` does not close the flows that are still there.
+  A :class:`Closed` event is sent for it, unless it was already closed
+  when it went out of sight: a flow is closed once and once only.
 
 The sockets of a flow
 ---------------------
@@ -72,7 +75,7 @@ three polls is closed and forgotten.
 from __future__ import annotations
 
 import threading
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
 
 from trafficmap.collector_ss import SocketRow
@@ -117,7 +120,8 @@ class Flow:
         process: The name of the process, empty when it is not known.
         pid: The number of the process, when it is known.
         proto: The protocol of the sockets, ``"tcp"`` or ``"udp"``.
-        port: The port of the remote address.
+        port: The dominant port of the flow: the port of the socket
+            that carries the most bytes.
         tx: The bytes the flow has sent.
         rx: The bytes the flow has received.
         tx_rate: The rate of sending, in bytes per second.
@@ -237,7 +241,7 @@ class _FlowState:
         process: The name of the process, empty when it is not known.
         pid: The number of the process.
         proto: The protocol of the sockets.
-        port: The port of the remote address.
+        port: The dominant port of the remote address.
         state: The state of the sockets.
         first_seen: When the flow appeared.
         last_seen: When the flow was seen the last time.
@@ -294,6 +298,10 @@ class FlowTable:
         self._local_peers: set[str] = set()
         self._unknown_peers: set[str] = set()
         self._last_update: float | None = None
+        #: The real lengths of the recent polls, in seconds.  Their sum
+        #: is the real time of :data:`CLOSE_POLLS` polls: it is the
+        #: deadline of the removal of a flow that nobody sees any more.
+        self._poll_lengths: deque[float] = deque(maxlen=CLOSE_POLLS)
         # The lock is re-entrant: :meth:`stats` reads the flows while it
         # holds it.  It is never held while the program waits for
         # something.
@@ -359,7 +367,7 @@ class FlowTable:
                 rx_rate += rx
                 peers.add(state.geo.ip)
                 countries[state.geo.country] += 1
-                label = f"{state.process or UNKNOWN_PROCESS}:{_dominant_port(state)}"
+                label = f"{state.process or UNKNOWN_PROCESS}:{state.port}"
                 totals[label] = totals.get(label, 0.0) + tx + rx
 
             top = sorted(totals.items(), key=lambda item: (-item[1], item[0]))
@@ -442,7 +450,7 @@ class FlowTable:
         # The sockets that are gone do not count any more.
         self._prune(socket_keys)
 
-        # The rates and the moment of the last byte.
+        # The rates, the dominant port and the moment of the last byte.
         for key in seen:
             state = self._flows[key]
             dtx, drx = deltas.get(key, (0, 0))
@@ -450,6 +458,10 @@ class FlowTable:
                 state.last_activity = now
             state.tx_rate = _smooth(state.tx_rate, dtx / elapsed)
             state.rx_rate = _smooth(state.rx_rate, drx / elapsed)
+            # The port of the flow is the port of the socket that
+            # carries the most bytes: it follows the sockets of the
+            # flow.
+            state.port = _dominant_port(state)
 
         # A flow that was out of sight and carries bytes again is
         # visible again.
@@ -495,6 +507,9 @@ class FlowTable:
         elapsed = now - previous
         if elapsed <= 0.0:
             return self._poll_seconds
+        # The real length of the poll is kept: it is the deadline of
+        # the removal of a flow that is not seen any more.
+        self._poll_lengths.append(elapsed)
         return elapsed
 
     def _visible_states(self) -> list[_FlowState]:
@@ -554,6 +569,10 @@ class FlowTable:
     def _close(self, now: float) -> list[Closed]:
         """Remove the flows that have been quiet for too long.
 
+        The deadline is the real time of :data:`CLOSE_POLLS` polls, the
+        same time the rates are computed with: a slow command does not
+        close the flows that are still there.
+
         Args:
             now: The moment of the poll, in seconds.
 
@@ -562,7 +581,7 @@ class FlowTable:
             flow that was already closed when it went out of sight is
             removed without a second :class:`Closed`.
         """
-        deadline = CLOSE_POLLS * self._poll_seconds
+        deadline = self._close_deadline()
         closed: list[Closed] = []
         for key in list(self._flows):
             state = self._flows[key]
@@ -573,6 +592,22 @@ class FlowTable:
                 state.visible = False
                 closed.append(Closed(key=key))
         return closed
+
+    def _close_deadline(self) -> float:
+        """Return the real time of :data:`CLOSE_POLLS` polls, in seconds.
+
+        The lengths of the recent polls are added up: they are the real
+        time of the polls, so a poll that took long gives the flows
+        more time to come back.  The length of the poll of the
+        configuration is used when the table has no measure of its own
+        yet.
+
+        Returns:
+            The deadline of the removal of a flow, in seconds.
+        """
+        if not self._poll_lengths:
+            return CLOSE_POLLS * self._poll_seconds
+        return sum(self._poll_lengths)
 
     def _prune(self, socket_keys: dict[str, set[str]]) -> None:
         """Drop the sockets that are gone from the flows they were in.

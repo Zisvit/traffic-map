@@ -35,7 +35,7 @@ from typing import Any, Callable, TextIO
 from trafficmap.collector_mock import MockCollector
 from trafficmap.collector_ss import SocketRow, SsCollector
 from trafficmap.config import Config
-from trafficmap.flows import Closed, FlowEvent, FlowTable, Opened, Updated
+from trafficmap.flows import Closed, FlowEvent, FlowTable, Opened
 from trafficmap.geo import GeoResolver
 
 __all__ = ["dump_events", "run_dump"]

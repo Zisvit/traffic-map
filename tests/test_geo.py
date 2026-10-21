@@ -403,6 +403,29 @@ def test_public_ip_ignores_a_garbage_answer(monkeypatch):
     assert geo._fetch_public_ip() is None
 
 
+def test_the_request_names_the_program_and_nothing_else(monkeypatch):
+    """The User-Agent does not point at a site that does not exist."""
+    agents = []
+
+    class Response:
+        def read(self, size=0):
+            return b"203.0.113.9"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        agents.append(request.get_header("User-agent"))
+        return Response()
+
+    monkeypatch.setattr(geo.urllib.request, "urlopen", fake_urlopen)
+    assert geo._fetch_public_ip() == "203.0.113.9"
+    assert agents == ["trafficmap/0.1"]
+
+
 def test_missing_city_database_raises(tmp_path):
     with pytest.raises(FileNotFoundError) as info:
         GeoResolver(tmp_path / "missing.mmdb")

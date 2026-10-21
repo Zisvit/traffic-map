@@ -42,9 +42,12 @@ from trafficmap.ui import (
     _Map,
     _State,
     _colour_of,
+    _format_rate,
+    _handle_key,
     _in_cells,
     _status_lines,
     _text_rows,
+    _top_panel,
 )
 
 ASSETS = Path(__file__).resolve().parents[1] / "assets"
@@ -662,3 +665,58 @@ def test_the_ascii_rows_hold_the_glyph_of_the_style():
     # The Braille mode is not touched by the ASCII one.
     assert _text_rows(canvas, styles, False) == canvas.rows()
     assert all("⠀" <= char <= "⣿" for char in canvas.rows()[0])
+
+
+def test_the_rates_are_read_as_rates():
+    """A rate is a rate per second, not an amount of bytes."""
+    assert _format_rate(512) == "512 B/s"
+    assert _format_rate(9_000_000) == "9.0 MB/s"
+    assert _format_rate(1_200_000) == "1.2 MB/s"
+    assert _format_rate(101_000) == "101.0 KB/s"
+
+
+def test_the_second_line_of_the_status_bar_shows_rates():
+    """The busiest flows of the status bar show their rate."""
+    map_ = make_map(ANCHOR, 1)
+    flow = make_flow("1.1.1.1|100|tcp", "curl", LOCAL_PEER, rate=9_000_000.0)
+    state = _State(Config())
+    state.update([flow], stats_of([flow]))
+    line = "".join(part for part, _ in _status_lines(map_, state, state.stats)[1])
+    assert "curl:443 ↑9.0 MB/s" in line
+    # The rate is not an amount of bytes.
+    assert "9.0M" not in line
+
+
+def test_the_panel_of_the_busiest_flows_shows_rates():
+    """The panel of the busiest flows shows the rate of every flow."""
+    map_ = make_map(ANCHOR, 1)
+    flow = make_flow("1.1.1.1|100|tcp", "curl", LOCAL_PEER, rate=9_000_000.0)
+    state = _State(Config())
+    state.update([flow], stats_of([flow]))
+    lines = _top_panel(map_, state)
+    text = " ".join(text for _, _, text, _ in lines)
+    assert "curl:443" in text
+    assert "9.0 MB/s" in text
+    assert "9.0M" not in text
+
+
+def test_the_escape_key_takes_the_filter_away():
+    """The escape key clears the filter, as the panel of the keys says."""
+    map_ = make_map(ANCHOR, 1)
+    curl = make_flow("1.1.1.1|100|tcp", "curl", LOCAL_PEER)
+    firefox = make_flow("8.8.8.8|200|tcp", "firefox", FAR_PEER)
+    state = _State(Config())
+    state.update([curl, firefox], stats_of([curl, firefox]))
+    state.set_filter("curl")
+    assert state.filter == "curl"
+    assert state.stats.flows == 1
+    line = "".join(part for part, _ in _status_lines(map_, state, state.stats)[2])
+    assert "filter: curl" in line
+
+    # The escape key gives the filter up: every flow is on the map.
+    assert _handle_key(27, state, map_) is True
+    assert state.filter == ""
+    assert state.stats.flows == 2
+    assert state.hidden == set()
+    line = "".join(part for part, _ in _status_lines(map_, state, state.stats)[2])
+    assert "filter:" not in line

@@ -27,7 +27,7 @@
 | `src/trafficmap/collector_ss.py` | парсер `ss`, запуск опроса |
 | `src/trafficmap/collector_mock.py` | JSONL-реплей |
 | `src/trafficmap/flows.py` | FlowTable, дельты, события, Stats |
-| `src/trafficmap/anim.py` | Comet / Peer / Pulse |
+| `src/trafficmap/anim.py` | Comet / Peer |
 | `src/trafficmap/ui.py` | curses, раскладка, клавиши, snapshot |
 | `src/trafficmap/__main__.py` | сборка зависимостей, запуск |
 | `tests/` | unit + snapshot |
@@ -499,7 +499,7 @@ def test_animator_caps_comets():
 
 - [ ] **Step 2: Реализовать** `Comet.head(now)` (индекс по `t`, clip), `trail`
   (12 точек назад), `expired`, `Animator.spawn/prune/draw(canvas, viewport, now)`,
-  `Peer` с TTL 10 с и `Pulse`. Политика спавна: `Opened` → 1 комета; `Updated` →
+  `Peer` с TTL 10 с. Политика спавна: `Opened` → 1 комета; `Updated` →
   комета при `rate > 32 КБ/с`, не чаще одной на флоу за 300 мс; направление по
   большему из `dtx`/`drx`. Лимит 200 комет, старые вытесняются. `draw` кладёт
   голову стилем 6, след — 5/3/2 по возрасту, пиров — стилем 4, anchor — 7.
@@ -583,7 +583,7 @@ sudo .venv/bin/tmap        # глазами: кометы, ресайз, пау�
 - [ ] **Step 1: `--ascii`** — заменить глифы карты на `#`, пиры на `*`, кометы на `+`,
   след на `-`; snapshot-тест с `--ascii` не должен содержать Braille.
 - [ ] **Step 2: no-root баннер** — `os.geteuid() != 0` → жёлтая строка
-  `no root: only your sockets`; в `--dump` добавить поле.
+  `no root: only your sockets`; ~~в `--dump` добавить поле~~ (в дампе такого поля нет).
 - [ ] **Step 3: systemd unit** — `User=root`, `ExecStart=~/Projects/traffic-map/.venv/bin/tmap`,
   `Restart=on-failure`, `StandardInput=tty`, `TTYPath=/dev/tty1` (документировать,
   что проще запускать из shell).

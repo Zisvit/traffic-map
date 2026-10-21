@@ -34,7 +34,8 @@ The filter
 The filter of the process hides the flows that do not hold its name.
 The peers of the hidden flows are kept, they are only not drawn: the
 filter is therefore reversible, and the numbers of the status bar
-count the flows that are on the map.
+count the flows that are on the map.  The escape key takes the filter
+away, and the map shows every flow again.
 
 The ASCII mode
 --------------
@@ -229,20 +230,21 @@ _ASCII_GLYPHS: dict[int, str] = {
 #: The glyph of a cell whose style is not known.
 _ASCII_UNKNOWN = " "
 
+#: The canvas the incoming comets are drawn on a second time, to know
+#: which cells they touch.  It is kept between the frames and cleared
+#: at every frame: a new one at every frame would cost an allocation
+#: the size of the map at every frame.
+_scratch: Canvas | None = None
+
+#: The size the scratch canvas was built for.
+_scratch_size: tuple[int, int] = (0, 0)
+
 #: The units of the rates, in bytes per second.
 _RATE_UNITS = (
     ("KB", 1_000.0),
     ("MB", 1_000.0**2),
     ("GB", 1_000.0**3),
     ("TB", 1_000.0**4),
-)
-
-#: The units of the amounts of bytes.
-_BYTE_UNITS = (
-    ("K", 1_000.0),
-    ("M", 1_000.0**2),
-    ("G", 1_000.0**3),
-    ("T", 1_000.0**4),
 )
 
 
@@ -620,6 +622,11 @@ def _filtered_stats(state: _State, table_stats: Stats) -> Stats:
 def _format_rate(value: float) -> str:
     """Format a rate in bytes per second.
 
+    A rate is not an amount of bytes: it is what flows every second.
+    The units are the decimal ones, and the value has one decimal, so
+    that a rate of nine megabytes a second reads ``"9.0 MB/s"`` and not
+    ``"9.0M"``.
+
     Args:
         value: The rate, in bytes per second.
 
@@ -633,24 +640,6 @@ def _format_rate(value: float) -> str:
         if number < scale * 1000.0:
             return f"{number / scale:.1f} {unit}/s"
     return f"{number / _RATE_UNITS[-1][1]:.1f} PB/s"
-
-
-def _format_bytes(value: float) -> str:
-    """Format an amount of bytes.
-
-    Args:
-        value: The amount of bytes.
-
-    Returns:
-        The amount with a decimal unit, ``"9.1M"`` for example.
-    """
-    number = float(value)
-    if number < 1000.0:
-        return f"{int(number)}B"
-    for unit, scale in _BYTE_UNITS:
-        if number < scale * 1000.0:
-            return f"{number / scale:.1f}{unit}"
-    return f"{number / _BYTE_UNITS[-1][1]:.1f}P"
 
 
 def _is_root() -> bool:
@@ -729,6 +718,28 @@ def _attr(colour: int) -> int:
     return curses.color_pair(colour) | _PALETTE[colour].attr
 
 
+def _scratch_canvas(width: int, height: int) -> Canvas:
+    """Return the scratch canvas of the incoming comets, empty.
+
+    The canvas of the last frame is reused when it has the right size,
+    and it is cleared: it holds nothing but the comets of this frame.
+
+    Args:
+        width: The width of the canvas, in dots.
+        height: The height of the canvas, in dots.
+
+    Returns:
+        The scratch canvas, empty.
+    """
+    global _scratch, _scratch_size
+    if _scratch is None or _scratch_size != (width, height):
+        _scratch = Canvas(width, height)
+        _scratch_size = (width, height)
+    else:
+        _scratch.clear()
+    return _scratch
+
+
 def _in_cells(
     animator: Animator, viewport: Viewport, width: int, height: int, now: float
 ) -> dict[int, dict[int, str]]:
@@ -757,7 +768,7 @@ def _in_cells(
     ]
     if not comets:
         return cells
-    scratch = Canvas(width, height)
+    scratch = _scratch_canvas(width, height)
     for comet in comets:
         points = comet.trail(now, animator.trail_length)
         if not points:
@@ -939,7 +950,7 @@ def _top_panel(map_: _Map, state: _State) -> list[tuple[int, int, str, int]]:
     )
     for flow in busiest[:TOP_PANEL_ROWS]:
         arrow = "↑" if flow.tx_rate >= flow.rx_rate else "↓"
-        rate = _format_bytes(flow.tx_rate + flow.rx_rate)
+        rate = _format_rate(flow.tx_rate + flow.rx_rate)
         label = _label_of(flow)[:14].ljust(14)
         lines.append(f" {label} {flow.remote.country:<2} {arrow}{rate:>6}")
     return _panel_lines(lines, column, TOP_PANEL_COLUMNS)
@@ -1010,7 +1021,7 @@ def _status_lines(
     items = []
     for label, rate in stats.top[:3]:
         arrow = state.directions.get(label, "·")
-        items.append(f"{label} {arrow}{_format_bytes(rate)}")
+        items.append(f"{label} {arrow}{_format_rate(rate)}")
     second = [(" · ".join(items)[: map_.cols], _C_DEFAULT)]
 
     third: list[tuple[str, int]] = []
@@ -1296,6 +1307,9 @@ def _addstr(
 def _handle_key(key: int, state: _State, map_: _Map) -> bool:
     """Take one key of the terminal into account.
 
+    The escape key takes the filter of the process away: the flows of
+    the other processes come back on the map at once.
+
     Args:
         key: The key.
         state: What the interface knows.
@@ -1316,6 +1330,10 @@ def _handle_key(key: int, state: _State, map_: _Map) -> bool:
         state.show_help = not state.show_help
     elif key in (ord("1"), ord("2"), ord("3")):
         map_.zoom = key - ord("0")
+    elif key == 27:
+        # The escape key gives the filter up: every flow is on the map
+        # again, and the status bar does not show a filter any more.
+        state.set_filter("")
     return True
 
 

@@ -522,6 +522,51 @@ def test_the_top_names_the_dominant_port_of_the_flow(resolver):
     assert table.stats().top == [("curl:8080", pytest.approx(5100))]
 
 
+def test_the_port_of_the_flow_is_the_dominant_one(resolver):
+    """The flow names the same port as the list of the busiest flows."""
+    table = FlowTable(resolver, poll_ms=1000)
+    table.update(
+        [
+            row(local_port=51000, port=443, sent=0),
+            row(local_port=51001, port=8080, sent=0),
+        ],
+        now=0.0,
+    )
+    table.update(
+        [
+            row(local_port=51000, port=443, sent=100),
+            row(local_port=51001, port=8080, sent=5000),
+        ],
+        now=1.0,
+    )
+    flow = table.flows()[0]
+    assert flow.port == 8080
+    assert table.stats().top[0][0] == f"curl:{flow.port}"
+
+
+def test_the_port_of_the_flow_follows_its_sockets(resolver):
+    """The port of the flow changes when the sockets change."""
+    table = FlowTable(resolver, poll_ms=1000)
+    table.update([row(local_port=51000, port=443, sent=1000)], now=0.0)
+    assert table.flows()[0].port == 443
+    # The socket that carries the traffic talks to another port.
+    table.update([row(local_port=51000, port=8080, sent=9000)], now=1.0)
+    assert table.flows()[0].port == 8080
+    assert table.stats().top[0][0] == "curl:8080"
+
+
+def test_a_slow_poll_does_not_close_the_flows(resolver):
+    """A slow command must not close the flows that are still there."""
+    table = FlowTable(resolver, poll_ms=1000)
+    key = table.update([row(sent=1000)], now=0.0)[0].flow.key
+    # The polls take five seconds each: the flow is not seen in the
+    # second one, but it is not gone either.
+    events = table.update([], now=5.0)
+    assert not any(isinstance(event, Closed) for event in events)
+    assert key in table._flows
+    assert [flow.key for flow in table.flows()] == [key]
+
+
 def test_the_table_is_safe_to_read_while_it_is_written(resolver):
     table = FlowTable(resolver, poll_ms=1000)
     errors: list[BaseException] = []

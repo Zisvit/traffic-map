@@ -512,9 +512,7 @@ def _public_ip_from(url: str, deadline: float) -> str | None:
         something that is not an address.
     """
     remaining = deadline - time.monotonic()
-    request = urllib.request.Request(
-        url, headers={"User-Agent": "trafficmap/0.1 (+https://example.invalid)"}
-    )
+    request = urllib.request.Request(url, headers={"User-Agent": "trafficmap/0.1"})
     try:
         with urllib.request.urlopen(
             request, timeout=max(MIN_HTTP_TIMEOUT, remaining)
