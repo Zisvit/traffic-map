@@ -7,6 +7,10 @@ that answers with a fixed place.
 
 import io
 import json
+import os
+import signal
+import threading
+import time
 
 import pytest
 
@@ -225,3 +229,84 @@ def test_run_dump_survives_a_failing_collector(tmp_path):
     cfg = Config(dump=path, poll_ms=10)
     assert run_dump(cfg, FakeResolver(), FailingCollector()) == 0
     assert path.exists()
+
+
+def test_a_failing_poll_does_not_close_the_flows(tmp_path):
+    class FlakyCollector:
+        """A collector that works, fails for a while, then works again.
+
+        Args:
+            failures: The number of polls that fail.
+        """
+
+        def __init__(self, failures):
+            self.failures = failures
+            self.calls = 0
+
+        def poll(self):
+            self.calls += 1
+            if 1 < self.calls <= self.failures + 1:
+                raise RuntimeError("ss is not there")
+            if self.calls > self.failures + 2:
+                raise KeyboardInterrupt
+            return [
+                SocketRow(
+                    proto="tcp",
+                    local=("10.0.0.2", 51000),
+                    remote=("1.1.1.1", 443),
+                    state="ESTAB",
+                    pid=100,
+                    process="curl",
+                    bytes_sent=1000 * self.calls,
+                    bytes_received=500 * self.calls,
+                    key="tcp|10.0.0.2:51000|1.1.1.1:443|100",
+                )
+            ]
+
+    path = tmp_path / "flows.jsonl"
+    cfg = Config(dump=path, poll_ms=20)
+    assert run_dump(cfg, FakeResolver(), FlakyCollector(failures=12)) == 0
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    # The failed polls changed nothing: the flow was never closed and
+    # never opened a second time.
+    assert [record["type"] for record in records] == ["opened", "updated"]
+    assert records[0]["tx"] == 1000
+    assert records[1]["tx"] == 14000
+
+
+def test_run_dump_stops_on_sigterm(tmp_path):
+    if not hasattr(signal, "SIGTERM"):
+        pytest.skip("this system has no SIGTERM")
+    if threading.current_thread() is not threading.main_thread():
+        pytest.skip("the signal can only be sent from the main thread")
+
+    class EndlessCollector:
+        """A collector that works and never stops."""
+
+        def poll(self):
+            return [
+                SocketRow(
+                    proto="tcp",
+                    local=("10.0.0.2", 51000),
+                    remote=("1.1.1.1", 443),
+                    state="ESTAB",
+                    pid=100,
+                    process="curl",
+                    bytes_sent=1000,
+                    bytes_received=500,
+                    key="tcp|10.0.0.2:51000|1.1.1.1:443|100",
+                )
+            ]
+
+    def stop():
+        """Ask the dump to stop the way a service manager does."""
+        time.sleep(0.05)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    path = tmp_path / "flows.jsonl"
+    cfg = Config(dump=path, poll_ms=10)
+    threading.Thread(target=stop, daemon=True).start()
+    assert run_dump(cfg, FakeResolver(), EndlessCollector()) == 0
+    # The file was flushed before the program left.
+    assert path.exists()
+    assert path.read_text().strip() != ""

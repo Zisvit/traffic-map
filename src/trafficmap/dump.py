@@ -17,14 +17,20 @@ a person with ``grep``.  A closed flow has nothing to show but its key::
 The dump never touches the terminal: it is a plain file, and the
 program that writes it can run in a window, in a container or in a
 service.
+
+A poll that fails changes nothing.  The sockets are not read, the table
+is not touched and no event is written: a command that fails once may
+well work the next time, and a failed poll must not close the flows
+that are still there.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import signal
 import time
-from typing import Any, TextIO
+from typing import Any, Callable, TextIO
 
 from trafficmap.collector_ss import SocketRow, SsCollector
 from trafficmap.config import Config
@@ -62,7 +68,8 @@ def run_dump(cfg: Config, resolver: GeoResolver, collector: SsCollector) -> int:
         collector: The collector that reads the sockets.
 
     Returns:
-        ``0`` when the program was stopped with ``Ctrl-C``.
+        ``0`` when the program was stopped with ``Ctrl-C`` or with
+        ``SIGTERM``.
 
     Raises:
         ValueError: If the configuration has no path for the dump.
@@ -72,35 +79,77 @@ def run_dump(cfg: Config, resolver: GeoResolver, collector: SsCollector) -> int:
 
     table = FlowTable(resolver, poll_ms=cfg.poll_ms)
     interval = cfg.poll_ms / 1000.0
+    restore = _install_term_handler()
     try:
         with open(cfg.dump, "w", encoding="utf-8") as out:
             while True:
                 now = time.monotonic()
                 rows = _poll(collector)
-                events = table.update(rows, now)
-                dump_events(events, now, out)
-                out.flush()
+                if rows is not None:
+                    events = table.update(rows, now)
+                    dump_events(events, now, out)
+                    out.flush()
                 time.sleep(interval)
     except KeyboardInterrupt:
         log.debug("the dump was stopped")
         return 0
+    finally:
+        if restore is not None:
+            restore()
 
 
-def _poll(collector: SsCollector) -> list[SocketRow]:
+def _poll(collector: SsCollector) -> list[SocketRow] | None:
     """Read the sockets once and survive a failure of the command.
 
     Args:
         collector: The collector that reads the sockets.
 
     Returns:
-        The sockets of the poll, or an empty list when the command
-        failed.  A command that fails once may well work the next time.
+        The sockets of the poll, or ``None`` when the command failed.
+        A failed poll leaves the table alone: an empty list would close
+        every flow and open it again at the next poll.
     """
     try:
         return collector.poll()
     except RuntimeError as exc:
-        log.warning("cannot read the sockets: %s", exc)
-        return []
+        log.debug("cannot read the sockets: %s", exc)
+        return None
+
+
+def _install_term_handler() -> Callable[[], None] | None:
+    """Make ``SIGTERM`` stop the dump like ``Ctrl-C`` does.
+
+    Returns:
+        A function that puts the old handler back, or ``None`` when the
+        handler could not be installed: the program is not the main
+        thread, or the system has no ``SIGTERM``.
+    """
+    if not hasattr(signal, "SIGTERM"):
+        return None
+    try:
+        previous = signal.signal(signal.SIGTERM, _stop_the_dump)
+    except (OSError, ValueError):
+        # Not the main thread: the signal is not ours to handle.
+        return None
+
+    def restore() -> None:
+        """Put the old handler of ``SIGTERM`` back."""
+        try:
+            signal.signal(signal.SIGTERM, previous)
+        except (OSError, ValueError):
+            pass
+
+    return restore
+
+
+def _stop_the_dump(signum: int, frame: object) -> None:
+    """Stop the dump the way ``Ctrl-C`` does.
+
+    Args:
+        signum: The number of the signal.
+        frame: The frame the signal arrived in.
+    """
+    raise KeyboardInterrupt
 
 
 def _record(event: FlowEvent, now: float) -> dict[str, Any]:

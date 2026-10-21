@@ -17,14 +17,21 @@ of that poll, and the delta is never negative.
 
 The flow is the unit of the map.  Its counters are the sums of the
 counters of its sockets, and its rates are the sums of the rates of the
-same.  A rate is the delta of the poll divided by the length of the
-poll, smoothed with an exponential moving average, so a rate does not
-jump with every packet and does not die the second the traffic stops.
+same.  A rate is the delta of the poll divided by the *real* length of
+the poll, smoothed with an exponential moving average, so a rate does
+not jump with every packet and does not die the second the traffic
+stops.  A rate that decays below one byte per second is put back to
+zero: at that point it is noise, not traffic.
 
 The key of a flow is ``"{remote_ip}|{pid}|{proto}"``: the port is not
 part of it, so the sockets of one process to one address make one flow
-even when they talk to different ports.  Such a flow keeps the port of
-the socket that opened it.
+even when they talk to different ports.  The address of the key is the
+*normalized* one, the address as the resolver knows it: an IPv4-mapped
+address (``::ffff:1.1.1.1``) and the address it hides (``1.1.1.1``) are
+one flow, and the closed records of the dump join the opened and the
+updated ones.  A flow keeps the port of the socket that opened it, and
+the list of the busiest flows names the *dominant* port of a flow, the
+port of the socket that carries the most bytes.
 
 Local addresses
 ---------------
@@ -34,14 +41,37 @@ is only counted, so the status bar can say how many of them there are.
 The same goes for a public address the GeoIP database does not know:
 there is no point to draw a point that is not known.
 
-Closing
--------
-A socket that is missing from a poll is dropped.  A flow without sockets
-that has been quiet for three polls is closed and forgotten.
+The life of a flow
+------------------
+A flow is *visible* (it is on the map), *hidden* (it is kept in the
+table but it is not on the map) or *gone* (it is removed from the
+table).  The rules are these:
+
+* A flow is visible unless it has been idle for more than
+  :data:`IDLE_SECONDS` seconds.  A flow is idle when it carried no byte
+  during that time.
+* When a visible flow goes idle, a :class:`Closed` event is sent, but
+  the flow *stays* in the table.  It is only out of sight.
+* When the traffic of a hidden flow starts again, the flow becomes
+  visible again: a second :class:`Opened` event is sent, followed by
+  the :class:`Updated` of the poll.  An event-driven user interface
+  hears about the flow again.
+* A flow whose sockets are all gone for more than :data:`CLOSE_POLLS`
+  polls is removed from the table.  A :class:`Closed` event is sent for
+  it, unless it was already closed when it went out of sight: a flow is
+  closed once and once only.
+
+The sockets of a flow
+---------------------
+A socket that is missing from a poll is dropped: it no longer counts
+in the totals of its flow, nor in its rates, nor in the set of sockets
+the table keeps for it.  A flow without sockets that has been quiet for
+three polls is closed and forgotten.
 """
 
 from __future__ import annotations
 
+import threading
 from collections import Counter
 from dataclasses import dataclass, field
 
@@ -61,7 +91,7 @@ __all__ = [
 #: Number of polls without a sign of life after which a flow is closed.
 CLOSE_POLLS = 3
 
-#: Seconds after which a flow that never carried a byte is left out.
+#: Seconds after which a flow that carries nothing is left out.
 IDLE_SECONDS = 5.0
 
 #: Weight of the new value in the moving average of a rate.
@@ -72,6 +102,9 @@ TOP_LIMIT = 5
 
 #: Label of a flow whose process is not known.
 UNKNOWN_PROCESS = "unknown"
+
+#: Rate below which a rate that decays is put back to zero.
+MIN_RATE = 1.0
 
 
 @dataclass(slots=True)
@@ -157,7 +190,8 @@ class Stats:
         peers: The number of the distinct remote addresses.
         countries: The number of the flows per country.
         top: The busiest flows, ``(label, rate)`` pairs, the label being
-            ``"process:port"``.
+            ``"process:port"``, the port being the dominant one of the
+            flow.
         local: The number of the distinct local addresses of the last
             poll.  They are not on the map.
         unknown: The number of the distinct public addresses of the last
@@ -183,12 +217,14 @@ class _Counters:
         received: The value of the other counter.
         total_tx: The bytes the socket sent since it was seen.
         total_rx: The bytes the socket received since it was seen.
+        port: The port of the other side of the socket.
     """
 
     sent: int
     received: int
     total_tx: int
     total_rx: int
+    port: int = 0
 
 
 @dataclass(slots=True)
@@ -205,6 +241,8 @@ class _FlowState:
         state: The state of the sockets.
         first_seen: When the flow appeared.
         last_seen: When the flow was seen the last time.
+        last_activity: When the flow carried bytes the last time.
+        visible: Whether the flow is on the map.
         tx_rate: The rate of sending, ``None`` while the flow never
             carried anything.
         rx_rate: The rate of receiving.
@@ -220,6 +258,8 @@ class _FlowState:
     state: str
     first_seen: float
     last_seen: float
+    last_activity: float
+    visible: bool = True
     tx_rate: float | None = None
     rx_rate: float | None = None
     sockets: dict[str, _Counters] = field(default_factory=dict)
@@ -228,15 +268,17 @@ class _FlowState:
 class FlowTable:
     """Turn the sockets of every poll into flows, rates and events.
 
-    The table is used by one thread at a time: the collector thread
-    calls :meth:`update` and the user interface reads :meth:`flows` and
-    :meth:`stats`.  The objects it returns are copies, so the caller
+    The collector thread calls :meth:`update` and the user interface
+    reads :meth:`flows` and :meth:`stats`.  A lock guards the table, so
+    the two may run at the same time without seeing a half-written
+    poll.  The objects the table returns are copies, so the caller
     cannot change the state of the table by accident.
 
     Args:
         resolver: The resolver that tells where the remote addresses
             are.
-        poll_ms: The length of a poll, in milliseconds.
+        poll_ms: The length of a poll, in milliseconds.  It is the
+            length of the poll when the table has no measure of it yet.
 
     Raises:
         ValueError: If the length of a poll is not positive.
@@ -251,7 +293,11 @@ class FlowTable:
         self._flows: dict[str, _FlowState] = {}
         self._local_peers: set[str] = set()
         self._unknown_peers: set[str] = set()
-        self._now: float | None = None
+        self._last_update: float | None = None
+        # The lock is re-entrant: :meth:`stats` reads the flows while it
+        # holds it.  It is never held while the program waits for
+        # something.
+        self._lock = threading.RLock()
 
     @property
     def poll_ms(self) -> int:
@@ -267,15 +313,83 @@ class FlowTable:
 
         Returns:
             The events of the poll: an :class:`Opened` for every flow
-            that appears, an :class:`Updated` for every flow that
-            carried traffic, and a :class:`Closed` for every flow that
-            was quiet for too long.
+            that appears, an :class:`Opened` again for every flow that
+            was out of sight and carries bytes again, an
+            :class:`Updated` for every flow that carried traffic, and a
+            :class:`Closed` for every flow that went out of sight or
+            that is removed.
         """
-        self._now = now
+        with self._lock:
+            return self._update(rows, now)
+
+    def flows(self) -> list[Flow]:
+        """Return the flows that are on the map.
+
+        A flow that has been idle for more than five seconds is left
+        out: those are the leftovers of UDP sockets that hang around
+        without talking to anybody, and the connections that went quiet.
+
+        Returns:
+            A copy of every visible flow, in the order the flows
+            appeared.
+        """
+        with self._lock:
+            return [_snapshot(state) for state in self._visible_states()]
+
+    def stats(self) -> Stats:
+        """Return what the map shows about the traffic.
+
+        Returns:
+            The rates, the number of the flows and of the peers, the
+            countries, the busiest flows and the number of the local and
+            of the unknown addresses.
+        """
+        with self._lock:
+            alive = self._visible_states()
+            totals: dict[str, float] = {}
+            countries: Counter[str] = Counter()
+            peers: set[str] = set()
+            tx_rate = 0.0
+            rx_rate = 0.0
+
+            for state in alive:
+                tx = state.tx_rate if state.tx_rate is not None else 0.0
+                rx = state.rx_rate if state.rx_rate is not None else 0.0
+                tx_rate += tx
+                rx_rate += rx
+                peers.add(state.geo.ip)
+                countries[state.geo.country] += 1
+                label = f"{state.process or UNKNOWN_PROCESS}:{_dominant_port(state)}"
+                totals[label] = totals.get(label, 0.0) + tx + rx
+
+            top = sorted(totals.items(), key=lambda item: (-item[1], item[0]))
+            return Stats(
+                tx_rate=tx_rate,
+                rx_rate=rx_rate,
+                flows=len(alive),
+                peers=len(peers),
+                countries=countries,
+                top=top[:TOP_LIMIT],
+                local=len(self._local_peers),
+                unknown=len(self._unknown_peers),
+            )
+
+    def _update(self, rows: list[SocketRow], now: float) -> list[FlowEvent]:
+        """Do the work of a poll, with the lock held.
+
+        Args:
+            rows: The sockets of the poll.
+            now: The moment of the poll, in seconds.
+
+        Returns:
+            The events of the poll.
+        """
+        elapsed = self._elapsed(now)
         local: set[str] = set()
         unknown: set[str] = set()
         opened: list[str] = []
         seen: dict[str, None] = {}
+        socket_keys: dict[str, set[str]] = {}
         deltas: dict[str, tuple[int, int]] = {}
 
         for row in rows:
@@ -291,7 +405,10 @@ class FlowTable:
                 unknown.add(host)
                 continue
 
-            key = f"{host}|{row.pid}|{row.proto}"
+            # The key holds the address as the resolver knows it, so
+            # that an IPv4-mapped address and the address it hides are
+            # one flow.
+            key = f"{geo.ip}|{row.pid}|{row.proto}"
             state = self._flows.get(key)
             if state is None:
                 state = _FlowState(
@@ -304,6 +421,7 @@ class FlowTable:
                     state=row.state,
                     first_seen=now,
                     last_seen=now,
+                    last_activity=now,
                 )
                 self._flows[key] = state
                 opened.append(key)
@@ -311,6 +429,7 @@ class FlowTable:
                 state.state = row.state
             state.last_seen = now
             seen[key] = None
+            socket_keys.setdefault(key, set()).add(row.key)
 
             dtx, drx = self._count_socket(state, row)
             if dtx or drx:
@@ -320,14 +439,29 @@ class FlowTable:
         self._local_peers = local
         self._unknown_peers = unknown
 
-        events: list[FlowEvent] = []
+        # The sockets that are gone do not count any more.
+        self._prune(socket_keys)
+
+        # The rates and the moment of the last byte.
         for key in seen:
             state = self._flows[key]
             dtx, drx = deltas.get(key, (0, 0))
-            state.tx_rate = _smooth(state.tx_rate, dtx / self._poll_seconds)
-            state.rx_rate = _smooth(state.rx_rate, drx / self._poll_seconds)
+            if dtx or drx:
+                state.last_activity = now
+            state.tx_rate = _smooth(state.tx_rate, dtx / elapsed)
+            state.rx_rate = _smooth(state.rx_rate, drx / elapsed)
 
+        # A flow that was out of sight and carries bytes again is
+        # visible again.
+        woken: list[str] = []
+        for key in seen:
+            if self._wake(self._flows[key], now):
+                woken.append(key)
+
+        events: list[FlowEvent] = []
         for key in opened:
+            events.append(Opened(flow=_snapshot(self._flows[key])))
+        for key in woken:
             events.append(Opened(flow=_snapshot(self._flows[key])))
         for key in seen:
             if key in deltas:
@@ -336,63 +470,129 @@ class FlowTable:
                     Updated(flow=_snapshot(self._flows[key]), dtx=dtx, drx=drx)
                 )
 
+        events.extend(self._hide(now))
         events.extend(self._close(now))
         return events
 
-    def flows(self) -> list[Flow]:
-        """Return the flows that are on the map.
+    def _elapsed(self, now: float) -> float:
+        """Return the length of the poll that ends now, in seconds.
 
-        A flow that never carried a byte and is older than five seconds
-        is left out: those are the leftovers of UDP sockets that hang
-        around without talking to anybody.
+        The length is the real one, the time between the two polls, so
+        that a slow command does not inflate the rates.  The length of
+        the poll of the configuration is used when the table has no
+        measure of it yet.
+
+        Args:
+            now: The moment of the poll, in seconds.
 
         Returns:
-            A copy of every live flow, in the order the flows appeared.
+            The length of the poll, in seconds.
         """
-        now = self._now
-        alive: list[Flow] = []
-        # The list is a copy: the collector thread may add a flow while
-        # the user interface reads the table.
-        for state in list(self._flows.values()):
-            if now is not None and _is_idle(state, now):
+        previous = self._last_update
+        self._last_update = now
+        if previous is None:
+            return self._poll_seconds
+        elapsed = now - previous
+        if elapsed <= 0.0:
+            return self._poll_seconds
+        return elapsed
+
+    def _visible_states(self) -> list[_FlowState]:
+        """Return the states of the flows that are on the map.
+
+        The lock is held by the caller.
+
+        Returns:
+            The states of the visible flows, in the order the flows
+            appeared.
+        """
+        return [state for state in self._flows.values() if state.visible]
+
+    def _wake(self, state: _FlowState, now: float) -> bool:
+        """Tell whether a flow that was out of sight is on the map again.
+
+        Args:
+            state: The state of the flow.
+            now: The moment of the poll, in seconds.
+
+        Returns:
+            ``True`` when the flow was hidden and carries bytes again.
+            The flow is then visible again.
+        """
+        if state.visible:
+            return False
+        if now - state.last_activity > IDLE_SECONDS:
+            # The flow is still idle: it stays out of sight.
+            return False
+        state.visible = True
+        return True
+
+    def _hide(self, now: float) -> list[Closed]:
+        """Take the flows that have been idle for too long out of sight.
+
+        The flows stay in the table: they may wake up and be opened
+        again.
+
+        Args:
+            now: The moment of the poll, in seconds.
+
+        Returns:
+            A :class:`Closed` event for every flow that goes out of
+            sight.
+        """
+        closed: list[Closed] = []
+        for key in list(self._flows):
+            state = self._flows[key]
+            if not state.visible:
                 continue
-            alive.append(_snapshot(state))
-        return alive
+            if now - state.last_activity <= IDLE_SECONDS:
+                continue
+            state.visible = False
+            closed.append(Closed(key=key))
+        return closed
 
-    def stats(self) -> Stats:
-        """Return what the map shows about the traffic.
+    def _close(self, now: float) -> list[Closed]:
+        """Remove the flows that have been quiet for too long.
+
+        Args:
+            now: The moment of the poll, in seconds.
 
         Returns:
-            The rates, the number of the flows and of the peers, the
-            countries, the busiest flows and the number of the local and
-            of the unknown addresses.
+            A :class:`Closed` event for every flow that is removed.  A
+            flow that was already closed when it went out of sight is
+            removed without a second :class:`Closed`.
         """
-        alive = self.flows()
-        totals: dict[str, float] = {}
-        countries: Counter[str] = Counter()
-        peers: set[str] = set()
-        tx_rate = 0.0
-        rx_rate = 0.0
+        deadline = CLOSE_POLLS * self._poll_seconds
+        closed: list[Closed] = []
+        for key in list(self._flows):
+            state = self._flows[key]
+            if now - state.last_seen <= deadline:
+                continue
+            del self._flows[key]
+            if state.visible:
+                state.visible = False
+                closed.append(Closed(key=key))
+        return closed
 
-        for flow in alive:
-            tx_rate += flow.tx_rate
-            rx_rate += flow.rx_rate
-            peers.add(flow.remote.ip)
-            countries[flow.remote.country] += 1
-            label = f"{flow.process or UNKNOWN_PROCESS}:{flow.port}"
-            totals[label] = totals.get(label, 0.0) + flow.tx_rate + flow.rx_rate
+    def _prune(self, socket_keys: dict[str, set[str]]) -> None:
+        """Drop the sockets that are gone from the flows they were in.
 
-        top = sorted(totals.items(), key=lambda item: (-item[1], item[0]))
-        return Stats(
-            tx_rate=tx_rate,
-            rx_rate=rx_rate,
-            flows=len(alive),
-            peers=len(peers),
-            countries=countries,
-            top=top[:TOP_LIMIT],
-            local=len(self._local_peers),
-            unknown=len(self._unknown_peers),
-        )
+        A socket that is missing from the poll does not count any more:
+        not in the totals of its flow, nor in its rates, nor in the set
+        of sockets the table keeps.
+
+        Args:
+            socket_keys: The keys of the sockets of the poll, by flow.
+        """
+        for key, state in self._flows.items():
+            alive = socket_keys.get(key)
+            if alive is None:
+                # The flow has no socket at all any more.
+                state.sockets.clear()
+                continue
+            for socket_key in list(state.sockets):
+                if socket_key not in alive:
+                    del state.sockets[socket_key]
 
     def _count_socket(self, state: _FlowState, row: SocketRow) -> tuple[int, int]:
         """Record the bytes of one socket and return its delta.
@@ -415,6 +615,7 @@ class FlowTable:
                 received=received,
                 total_tx=sent,
                 total_rx=received,
+                port=row.remote[1],
             )
             return (0, 0)
 
@@ -428,24 +629,6 @@ class FlowTable:
         counters.total_rx += drx
         return (dtx, drx)
 
-    def _close(self, now: float) -> list[Closed]:
-        """Close the flows that have been quiet for too long.
-
-        Args:
-            now: The moment of the poll, in seconds.
-
-        Returns:
-            A :class:`Closed` event for every flow that is closed.
-        """
-        deadline = CLOSE_POLLS * self._poll_seconds
-        closed: list[Closed] = []
-        for key in list(self._flows):
-            state = self._flows[key]
-            if now - state.last_seen > deadline:
-                del self._flows[key]
-                closed.append(Closed(key=key))
-        return closed
-
 
 def _smooth(previous: float | None, instant: float) -> float | None:
     """Smooth a rate with the values of the polls.
@@ -458,28 +641,40 @@ def _smooth(previous: float | None, instant: float) -> float | None:
     Returns:
         The new rate.  A flow without a rate yet takes the instant one;
         a flow that was quiet keeps half of its rate and loses the other
-        half.
+        half.  A rate that falls below one byte per second is put back
+        to zero: it is noise, not traffic.
     """
     if previous is None:
-        return instant if instant > 0.0 else None
-    return RATE_ALPHA * instant + (1.0 - RATE_ALPHA) * previous
+        if instant <= 0.0:
+            return None
+        value = instant
+    else:
+        value = RATE_ALPHA * instant + (1.0 - RATE_ALPHA) * previous
+    if value < MIN_RATE:
+        return 0.0
+    return value
 
 
-def _is_idle(state: _FlowState, now: float) -> bool:
-    """Tell whether a flow may be left out of the map.
+def _dominant_port(state: _FlowState) -> int:
+    """Return the port of the socket that carries the most bytes.
 
     Args:
         state: The state of the flow.
-        now: The moment of the last poll, in seconds.
 
     Returns:
-        ``True`` for a flow that never carried a byte and that is older
-        than five seconds.
+        The port of the busiest socket of the flow.  The port of the
+        flow itself when no socket of it carries anything.
     """
-    if now - state.first_seen <= IDLE_SECONDS:
-        return False
-    tx, rx = _totals(state)
-    return tx + rx == 0
+    best_port = state.port
+    best_bytes = 0
+    for counters in state.sockets.values():
+        total = counters.total_tx + counters.total_rx
+        if total > best_bytes:
+            best_bytes = total
+            best_port = counters.port
+        elif total == best_bytes and total > 0 and counters.port < best_port:
+            best_port = counters.port
+    return best_port
 
 
 def _totals(state: _FlowState) -> tuple[int, int]:

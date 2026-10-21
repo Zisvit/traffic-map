@@ -1,3 +1,10 @@
+"""The command line of ``tmap``: the traffic of the machine on a map.
+
+``tmap`` reads the sockets of the machine, turns them into flows and
+shows them on a map.  Without a terminal it writes the flows to a file
+instead, one JSON object per line: see :mod:`trafficmap.dump`.
+"""
+
 import sys
 
 from trafficmap import __version__
