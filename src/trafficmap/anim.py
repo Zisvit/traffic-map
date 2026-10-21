@@ -46,6 +46,15 @@ A peer is kept as long as its flow lives: every event of the flow
 refreshes it, and a flow that is closed takes it away.  A peer that
 nobody touches any more fades away after :data:`PEER_TTL` seconds.
 
+The filter of the process
+-------------------------
+
+:meth:`Animator.set_hidden` hides some flows without losing them: the
+peers and the comets of the hidden flows stay in the animator, they are
+only not drawn.  The filter of the interface is therefore reversible:
+when the filter is removed, the peers are on the map again at once,
+without waiting for the flow to be seen again.
+
 The animator needs the anchor to build the route of a comet.  Without
 an anchor there is no route and no comet, but the peers are tracked
 all the same: the map shows the dots as soon as the anchor shows up.
@@ -147,13 +156,16 @@ class Comet:
             comes to it.
         weight: How heavy the traffic the comet carries is.  The
             animator does not use it yet, the renderer may.
+        flow_key: The key of the flow the comet belongs to.  It is
+            empty when the comet does not belong to a flow, and it is
+            what the filter of the process hides the comet by.
 
     Raises:
         ValueError: If the route is empty or the life is not
             positive.
     """
 
-    __slots__ = ("path", "born", "ttl", "weight", "_kind")
+    __slots__ = ("path", "born", "ttl", "weight", "flow_key", "_kind")
 
     def __init__(
         self,
@@ -162,6 +174,7 @@ class Comet:
         ttl: float = COMET_TTL,
         kind: str = "out",
         weight: float = 1.0,
+        flow_key: str = "",
     ) -> None:
         if not path:
             raise ValueError("a comet needs a route")
@@ -171,6 +184,7 @@ class Comet:
         self.born = born
         self.ttl = ttl
         self.weight = weight
+        self.flow_key = flow_key
         self._kind = kind
 
     @property
@@ -302,6 +316,7 @@ class Animator:
         "max_comets",
         "trail_length",
         "_comets",
+        "_hidden",
         "_peers",
         "_last_spawn",
     )
@@ -321,6 +336,10 @@ class Animator:
         self._comets: list[Comet] = []
         self._peers: dict[str, Peer] = {}
         self._last_spawn: dict[str, float] = {}
+        #: The keys of the flows that are not on the map.  The peers
+        #: and the comets of those flows are kept, they are only not
+        #: drawn.
+        self._hidden: set[str] = set()
 
     @property
     def comets(self) -> list[Comet]:
@@ -331,6 +350,33 @@ class Animator:
     def peers(self) -> list[Peer]:
         """The peers that are alive, the oldest one first."""
         return list(self._peers.values())
+
+    @property
+    def visible_peers(self) -> list[Peer]:
+        """The peers that are on the map, the oldest one first.
+
+        The peers of the hidden flows are alive, but they are not
+        drawn: see :meth:`set_hidden`.
+        """
+        return [peer for key, peer in self._peers.items() if key not in self._hidden]
+
+    @property
+    def hidden(self) -> frozenset[str]:
+        """The keys of the flows that are not on the map."""
+        return frozenset(self._hidden)
+
+    def set_hidden(self, keys: set[str]) -> None:
+        """Hide the flows of some keys without losing them.
+
+        The peers and the comets of the hidden flows stay in the
+        animator: they are drawn again as soon as the keys are not
+        hidden any more.  This is what makes the filter of the process
+        reversible.
+
+        Args:
+            keys: The keys of the flows that are not on the map.
+        """
+        self._hidden = set(keys)
 
     def handle_event(self, event: FlowEvent, now: float) -> None:
         """Take one event of the flow table into account.
@@ -372,9 +418,12 @@ class Animator:
             path: The points of the route of the comet.
             now: The moment the comet is born, in seconds.
             flow_key: The key of the flow the comet belongs to.  It
-                starts the cooldown of that flow.
+                starts the cooldown of that flow, and it is what the
+                filter of the process hides the comet by.
         """
-        self._comets.append(Comet(path, born=now, ttl=COMET_TTL, kind=kind))
+        self._comets.append(
+            Comet(path, born=now, ttl=COMET_TTL, kind=kind, flow_key=flow_key)
+        )
         while len(self._comets) > self.max_comets:
             self._comets.pop(0)
         if flow_key:
@@ -432,8 +481,14 @@ class Animator:
         canvas.set(point[0], point[1], STYLE_ANCHOR)
 
     def _draw_peers(self, canvas: Canvas, viewport: Viewport, now: float) -> None:
-        """Draw every peer that is alive as a single dot."""
-        for peer in self._peers.values():
+        """Draw every peer that is alive as a single dot.
+
+        The peers of the hidden flows are not drawn, but they are kept:
+        they come back as soon as the flow is not hidden any more.
+        """
+        for key, peer in self._peers.items():
+            if key in self._hidden:
+                continue
             if peer.expired(now):
                 continue
             geo = peer.geo
@@ -455,6 +510,8 @@ class Animator:
         """
         for comet in self._comets:
             if comet.expired(now):
+                continue
+            if comet.flow_key and comet.flow_key in self._hidden:
                 continue
             # The last point of the trail is the head: it is painted
             # with the style of the head, not with the style of the

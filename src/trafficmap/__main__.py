@@ -11,11 +11,10 @@ import argparse
 import sys
 
 from trafficmap import __version__
-from trafficmap.collector_ss import SsCollector
 from trafficmap.config import Config, load_config
 from trafficmap.dump import run_dump
 from trafficmap.geo import GeoResolver
-from trafficmap.ui import run, snapshot
+from trafficmap.ui import make_collector, run, snapshot
 
 
 def _version_parser() -> argparse.ArgumentParser:
@@ -82,7 +81,10 @@ def _run_dump(cfg: Config) -> int:
         print(f"tmap: {exc}", file=sys.stderr)
         return 2
     try:
-        return run_dump(cfg, resolver, SsCollector())
+        # The mock collector is used when a recording is named, so
+        # that the dump can be made without the sockets of the
+        # machine.
+        return run_dump(cfg, resolver, make_collector(cfg))
     except OSError as exc:
         print(f"tmap: cannot write the dump: {exc}", file=sys.stderr)
         return 2

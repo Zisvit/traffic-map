@@ -32,6 +32,7 @@ import signal
 import time
 from typing import Any, Callable, TextIO
 
+from trafficmap.collector_mock import MockCollector
 from trafficmap.collector_ss import SocketRow, SsCollector
 from trafficmap.config import Config
 from trafficmap.flows import Closed, FlowEvent, FlowTable, Opened, Updated
@@ -56,7 +57,9 @@ def dump_events(events: list[FlowEvent], now: float, out: TextIO) -> None:
         out.write("\n")
 
 
-def run_dump(cfg: Config, resolver: GeoResolver, collector: SsCollector) -> int:
+def run_dump(
+    cfg: Config, resolver: GeoResolver, collector: SsCollector | MockCollector
+) -> int:
     """Poll the sockets and write the events until the program stops.
 
     Args:
@@ -65,7 +68,8 @@ def run_dump(cfg: Config, resolver: GeoResolver, collector: SsCollector) -> int:
             sockets are read.
         resolver: The resolver that tells where the remote addresses
             are.
-        collector: The collector that reads the sockets.
+        collector: The collector that reads the sockets: the one of
+            ``ss``, or the one that replays a recording.
 
     Returns:
         ``0`` when the program was stopped with ``Ctrl-C`` or with
@@ -98,7 +102,7 @@ def run_dump(cfg: Config, resolver: GeoResolver, collector: SsCollector) -> int:
             restore()
 
 
-def _poll(collector: SsCollector) -> list[SocketRow] | None:
+def _poll(collector: SsCollector | MockCollector) -> list[SocketRow] | None:
     """Read the sockets once and survive a failure of the command.
 
     Args:

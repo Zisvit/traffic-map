@@ -24,6 +24,18 @@ only reads that queue, so the two never wait for each other.  The
 anchor is looked up once, in a thread of its own, so the map shows up
 right away.
 
+A collector that fails does not kill the thread: the error is kept and
+shown in the status bar, and the poll is tried again with a growing
+delay, from one second to five.  The data that was collected stays on
+the screen while the collector is down.
+
+The filter
+----------
+The filter of the process hides the flows that do not hold its name.
+The peers of the hidden flows are kept, they are only not drawn: the
+filter is therefore reversible, and the numbers of the status bar
+count the flows that are on the map.
+
 The snapshot
 ------------
 :func:`snapshot` runs the same pipeline without a terminal: the frames
@@ -61,12 +73,19 @@ from trafficmap.braille import Canvas
 from trafficmap.collector_mock import MockCollector
 from trafficmap.collector_ss import SocketRow, SsCollector
 from trafficmap.config import Config
-from trafficmap.flows import Closed, FlowEvent, FlowTable, Stats
+from trafficmap.flows import (
+    TOP_LIMIT,
+    UNKNOWN_PROCESS,
+    Flow,
+    FlowEvent,
+    FlowTable,
+    Stats,
+)
 from trafficmap.geo import Geo, GeoResolver
 from trafficmap.projection import Viewport, project, unproject
 from trafficmap.worldmap import load_land
 
-__all__ = ["run", "snapshot"]
+__all__ = ["make_collector", "run", "snapshot"]
 
 log = logging.getLogger(__name__)
 
@@ -96,6 +115,18 @@ TOP_PANEL_COLUMNS = 30
 
 #: Width of the panel of the keys.
 HELP_PANEL_COLUMNS = 46
+
+#: The first delay between two polls after a failure of the collector,
+#: in seconds.
+RETRY_FIRST = 1.0
+
+#: The step between two delays after a failure of the collector, in
+#: seconds.
+RETRY_STEP = 1.0
+
+#: The greatest delay between two polls after a failure of the
+#: collector, in seconds.
+RETRY_MAX = 5.0
 
 #: The keys the panel of the keys shows.
 HELP_LINES = (
@@ -222,23 +253,6 @@ class _Frame:
         return "\n".join(lines) + "\n"
 
 
-@dataclass(slots=True)
-class _FlowInfo:
-    """What the interface knows about one flow.
-
-    Attributes:
-        label: The name of the flow, ``"process:port"``.
-        country: The country of the other side.
-        tx_rate: The rate of sending, in bytes per second.
-        rx_rate: The rate of receiving, in bytes per second.
-    """
-
-    label: str
-    country: str
-    tx_rate: float
-    rx_rate: float
-
-
 class _State:
     """What the interface knows between two frames.
 
@@ -250,6 +264,7 @@ class _State:
         self.cfg = cfg
         self.animator = Animator()
         self.stats = _empty_stats()
+        self.table_stats = _empty_stats()
         self.anchor: Geo | None = None
         self.anchor_text = "anchor unknown"
         self.paused = False
@@ -259,45 +274,91 @@ class _State:
         self.filter = cfg.filter_process
         self.filter_input: str | None = None
         self.directions: dict[str, str] = {}
-        self.flows: dict[str, _FlowInfo] = {}
+        #: Every flow that is on the map, by key.
+        self.flows: dict[str, Flow] = {}
+        #: The flows that pass the filter of the process.
+        self.visible_flows: list[Flow] = []
+        #: The keys of the flows the filter leaves out.
+        self.hidden: set[str] = set()
+        #: The thread that polls the sockets, when the map is live.
+        self.collector: _CollectorThread | None = None
+        #: The message of the last failure of the collector.
+        self.error: str | None = None
         #: The clock of the animation.  It stands still while the map
         #: is paused, so that the map is frozen as a whole.
         self.now = 0.0
+        self.refresh()
 
-    def remember(self, event: FlowEvent) -> None:
-        """Take one event of the table into account.
+    def update(self, flows: list[Flow], stats: Stats) -> None:
+        """Take the flows and the statistics of the last poll into account.
+
+        The flows are the ones the table shows: they are the truth of
+        the map, and they replace the ones of the previous poll.
 
         Args:
-            event: The event: an opened, an updated or a closed one.
+            flows: The flows that are on the map.
+            stats: The statistics of the whole machine.
         """
-        if isinstance(event, Closed):
-            self.flows.pop(event.key, None)
-            return
-        flow = event.flow
-        label = f"{flow.process or 'unknown'}:{flow.port}"
-        self.directions[label] = "↑" if flow.tx_rate >= flow.rx_rate else "↓"
-        self.flows[flow.key] = _FlowInfo(
-            label=label,
-            country=flow.remote.country,
-            tx_rate=flow.tx_rate,
-            rx_rate=flow.rx_rate,
-        )
+        self.table_stats = stats
+        self.flows = {flow.key: flow for flow in flows}
+        self.directions = {
+            _label_of(flow): "↑" if flow.tx_rate >= flow.rx_rate else "↓"
+            for flow in flows
+        }
+        self.refresh()
 
-    def matches(self, event: FlowEvent) -> bool:
-        """Tell whether an event passes the filter of the process.
+    def set_filter(self, text: str) -> None:
+        """Set the filter of the process and apply it at once.
+
+        An empty text removes the filter: the peers of the flows that
+        were hidden come back at once.
 
         Args:
-            event: The event.
+            text: The name of the process to keep.
+        """
+        self.filter = text
+        self.refresh()
+
+    def refresh(self) -> None:
+        """Recompute the flows that pass the filter and the statistics.
+
+        The hidden flows keep their peers: the animator is told which
+        keys are not on the map, and it does not draw them.
+        """
+        visible: list[Flow] = []
+        hidden: set[str] = set()
+        for flow in self.flows.values():
+            if self.matches(flow):
+                visible.append(flow)
+            else:
+                hidden.add(flow.key)
+        self.visible_flows = visible
+        self.hidden = hidden
+        self.animator.set_hidden(hidden)
+        self.stats = _filtered_stats(self, self.table_stats)
+
+    def matches(self, flow: Flow) -> bool:
+        """Tell whether a flow passes the filter of the process.
+
+        Args:
+            flow: The flow.
 
         Returns:
             ``True`` when the filter is empty, or when the process of
-            the flow of the event holds the name of the filter.
+            the flow holds the name of the filter.
         """
         if not self.filter:
             return True
-        if isinstance(event, Closed):
-            return True
-        return self.filter in (event.flow.process or "")
+        return self.filter in (flow.process or "")
+
+    def read_error(self) -> None:
+        """Take the error of the collector into account.
+
+        The error is ``None`` when the last poll of the collector
+        worked.
+        """
+        collector = self.collector
+        self.error = collector.error if collector is not None else None
 
 
 class _Map:
@@ -362,9 +423,14 @@ class _Map:
         """Return the land of the visible part of the world.
 
         The whole world is rasterized once, in the size of the canvas.
-        A zoomed map takes the land it shows out of that raster, with
-        the nearest neighbour, so that the map is not rasterized again
-        at every zoom level.
+        The visible part is taken out of that raster, with the nearest
+        neighbour, so that the map is not rasterized again at every
+        zoom level.
+
+        The land is always taken in the frame of the viewport: the
+        viewport is centred on the anchor, so the land of the world is
+        moved with it.  The peers, the comets and the anchor are
+        placed in that same frame, and the land has to be there too.
 
         Returns:
             One byte per dot of the canvas: ``1`` for land, ``0`` for
@@ -382,7 +448,9 @@ class _Map:
         if self._visible is not None and self._visible_key == key:
             return self._visible
         world = self._world_mask()
-        if viewport.lon_span >= 360.0 and viewport.lat_span >= 180.0:
+        if _shows_the_whole_world(viewport):
+            # The raster of the world is already the visible part: the
+            # viewport is the one of the world, dot for dot.
             visible = world
         else:
             visible = _sample_mask(world, viewport)
@@ -399,6 +467,29 @@ class _Map:
             )
             self._world_size = size
         return self._world
+
+
+def _shows_the_whole_world(viewport: Viewport) -> bool:
+    """Tell whether the viewport is the one of the whole world.
+
+    The raster of the world is the picture of the world in the frame
+    of the world: the viewport that is centred on the Greenwich
+    meridian and that spans the whole world is that frame, dot for
+    dot.  Every other viewport has to take the land it shows out of
+    the raster, or the land would be painted in the wrong place.
+
+    Args:
+        viewport: The part of the world the canvas shows.
+
+    Returns:
+        ``True`` when the raster of the world is the visible part.
+    """
+    return (
+        viewport.lon_span >= 360.0
+        and viewport.lat_span >= 180.0
+        and viewport.center_lon == 0.0
+        and viewport.center_lat == 0.0
+    )
 
 
 def _sample_mask(world: bytearray, viewport: Viewport) -> bytearray:
@@ -449,6 +540,56 @@ def _empty_stats() -> Stats:
         top=[],
         local=0,
         unknown=0,
+    )
+
+
+def _label_of(flow: Flow) -> str:
+    """Return the name of a flow, as the status bar shows it.
+
+    Args:
+        flow: The flow.
+
+    Returns:
+        The name of the process and the port of the flow,
+        ``"firefox:443"`` for example.
+    """
+    return f"{flow.process or UNKNOWN_PROCESS}:{flow.port}"
+
+
+def _filtered_stats(state: _State, table_stats: Stats) -> Stats:
+    """Return the statistics of the flows that are on the map.
+
+    The rates of the machine, and the number of the local and of the
+    unknown addresses, are the ones of the whole machine: they tell
+    what the machine does, not what the map shows.  The number of the
+    flows, the number of the peers, the countries and the busiest
+    flows are the ones of the flows that pass the filter.
+
+    Args:
+        state: What the interface knows.
+        table_stats: The statistics of the table of the flows.
+
+    Returns:
+        The statistics of the visible flows.
+    """
+    countries: Counter[str] = Counter()
+    peers: set[str] = set()
+    totals: dict[str, float] = {}
+    for flow in state.visible_flows:
+        peers.add(flow.remote.ip)
+        countries[flow.remote.country] += 1
+        label = _label_of(flow)
+        totals[label] = totals.get(label, 0.0) + flow.tx_rate + flow.rx_rate
+    top = sorted(totals.items(), key=lambda item: (-item[1], item[0]))
+    return Stats(
+        tx_rate=table_stats.tx_rate,
+        rx_rate=table_stats.rx_rate,
+        flows=len(state.visible_flows),
+        peers=len(peers),
+        countries=countries,
+        top=top[:TOP_LIMIT],
+        local=table_stats.local,
+        unknown=table_stats.unknown,
     )
 
 
@@ -513,7 +654,7 @@ def _clock_of(collector: object) -> Callable[[], float]:
     return time.monotonic
 
 
-def _make_collector(cfg: Config) -> SsCollector | MockCollector:
+def make_collector(cfg: Config) -> SsCollector | MockCollector:
     """Build the collector of the program.
 
     Args:
@@ -598,18 +739,19 @@ def _in_cells(
         if not points:
             continue
         previous: tuple[int, int] | None = None
-        for lat, lon in points[:-1]:
+        for lat, lon in points:
             point = project(lat, lon, viewport)
             if point is None:
                 previous = None
                 continue
             if previous is not None:
                 scratch.line(previous[0], previous[1], point[0], point[1], 1)
+            else:
+                # The first point of the trail has no line to it: it
+                # is marked by itself, or the head of a newborn comet
+                # would be painted in the colour of the other comets.
+                scratch.set(point[0], point[1], 1)
             previous = point
-        lat, lon = points[-1]
-        point = project(lat, lon, viewport)
-        if point is not None and previous is not None:
-            scratch.line(previous[0], previous[1], point[0], point[1], 1)
     for cy, row in enumerate(scratch.cell_styles()):
         for cx, style in enumerate(row):
             if style:
@@ -708,7 +850,7 @@ def _country_labels(
         The labels, each a ``(line, column, text, colour)``.
     """
     labels: list[tuple[int, int, str, int]] = []
-    for peer in state.animator.peers:
+    for peer in state.animator.visible_peers:
         geo = peer.geo
         if geo.lat is None or geo.lon is None:
             continue
@@ -741,13 +883,13 @@ def _top_panel(map_: _Map, state: _State) -> list[tuple[int, int, str, int]]:
     column = max(0, map_.cols - TOP_PANEL_COLUMNS)
     lines = [" busiest flows"]
     busiest = sorted(
-        state.flows.values(), key=lambda info: -(info.tx_rate + info.rx_rate)
+        state.visible_flows, key=lambda flow: -(flow.tx_rate + flow.rx_rate)
     )
-    for info in busiest[:TOP_PANEL_ROWS]:
-        arrow = "↑" if info.tx_rate >= info.rx_rate else "↓"
-        rate = _format_bytes(info.tx_rate + info.rx_rate)
-        label = info.label[:14].ljust(14)
-        lines.append(f" {label} {info.country:<2} {arrow}{rate:>6}")
+    for flow in busiest[:TOP_PANEL_ROWS]:
+        arrow = "↑" if flow.tx_rate >= flow.rx_rate else "↓"
+        rate = _format_bytes(flow.tx_rate + flow.rx_rate)
+        label = _label_of(flow)[:14].ljust(14)
+        lines.append(f" {label} {flow.remote.country:<2} {arrow}{rate:>6}")
     return _panel_lines(lines, column, TOP_PANEL_COLUMNS)
 
 
@@ -821,6 +963,10 @@ def _status_lines(
 
     third: list[tuple[str, int]] = []
     parts: list[tuple[str, int]] = []
+    if state.error:
+        # The collector is down: the banner comes first, it is the
+        # most important thing the user has to know.
+        parts.append((f"collector error: {state.error}", _C_WARNING))
     if not _is_root():
         parts.append(("no root: only your sockets", _C_WARNING))
     parts.append((state.anchor_text, _C_DEFAULT))
@@ -899,21 +1045,32 @@ class _CollectorThread(threading.Thread):
     The thread owns the table of the flows: the interface never reads
     it, it only takes the events out of the queue.
 
+    A collector that fails does not kill the thread: the error is
+    remembered and shown in the status bar, and the poll is tried
+    again with a growing delay, from :data:`RETRY_FIRST` to
+    :data:`RETRY_MAX` seconds.  The delay goes back to
+    :data:`RETRY_FIRST` after a poll that worked.  The flows that were
+    collected stay on the screen all the time.
+
     Args:
         collector: The collector that reads the sockets.
         table: The table of the flows.
         out: The queue the events are put into.
         poll_ms: The length of a poll, in milliseconds.
         stop: The event that asks the thread to stop.
+        wait: The function that waits between two polls.  The wait of
+            the stop event is used when it is missing.  The tests give
+            their own, to keep the pace of the thread.
     """
 
     def __init__(
         self,
         collector: object,
         table: FlowTable,
-        out: "queue.Queue[tuple[list[FlowEvent], Stats, float]]",
+        out: "queue.Queue[tuple[list[FlowEvent], list[Flow], Stats, float]]",
         poll_ms: int,
         stop: threading.Event,
+        wait: Callable[[float], bool] | None = None,
     ) -> None:
         super().__init__(name="trafficmap-collector", daemon=True)
         self._collector = collector
@@ -922,22 +1079,69 @@ class _CollectorThread(threading.Thread):
         self._interval = poll_ms / 1000.0
         self._stop = stop
         self._clock = _clock_of(collector)
+        self._wait = wait if wait is not None else stop.wait
+        self._error: str | None = None
+        self._error_lock = threading.Lock()
+
+    @property
+    def error(self) -> str | None:
+        """The message of the last failure of the collector.
+
+        The message is ``None`` when the last poll worked.
+        """
+        with self._error_lock:
+            return self._error
+
+    def _set_error(self, message: str | None) -> None:
+        """Remember the message of the last failure of the collector.
+
+        Args:
+            message: The message of the failure, or ``None`` when the
+                last poll worked.
+        """
+        with self._error_lock:
+            self._error = message
 
     def run(self) -> None:
         """Poll the sockets until the program stops."""
         previous: float | None = None
+        retry = RETRY_FIRST
         while not self._stop.is_set():
             now = self._clock()
+            collector = self._collector
             try:
-                rows: list[SocketRow] | None = self._collector.poll()  # type: ignore[attr-defined]
-            except RuntimeError as exc:
-                log.debug("cannot read the sockets: %s", exc)
-                rows = None
-            if rows is not None and (previous is None or now != previous):
+                rows: list[SocketRow] = collector.poll()  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001 - the map must survive
+                # The collector is down: the error is shown in the
+                # status bar and the poll is tried again, later and
+                # later.  The message is logged at the info level: a
+                # warning would be written on the screen of the
+                # terminal, in the middle of the map.
+                log.info("cannot read the sockets: %s", exc)
+                self._set_error(_error_text(exc))
+                self._wait(retry)
+                retry = min(retry + RETRY_STEP, RETRY_MAX)
+                continue
+            self._set_error(None)
+            retry = RETRY_FIRST
+            if previous is None or now != previous:
                 events = self._table.update(rows, now)
                 previous = now
-                self._out.put((events, self._table.stats(), now))
-            self._stop.wait(self._interval)
+                self._out.put((events, self._table.flows(), self._table.stats(), now))
+            self._wait(self._interval)
+
+
+def _error_text(exc: BaseException) -> str:
+    """Return the text of a failure of the collector.
+
+    Args:
+        exc: The failure.
+
+    Returns:
+        The message of the failure, or the name of its class when the
+        failure has no message of its own.
+    """
+    return str(exc) or type(exc).__name__
 
 
 def _resolve_anchor(
@@ -1074,6 +1278,10 @@ def _read_filter(
     key, which gives it up.  The screen is drawn again after every
     key, so that the name is seen while it is written.
 
+    The filter is applied as soon as it is known: the peers of the
+    flows that it leaves out are hidden at once, and they come back at
+    once when it is removed.
+
     Args:
         stdscr: The screen of the terminal.
         state: What the interface knows.
@@ -1089,9 +1297,12 @@ def _read_filter(
         if key == -1:
             continue
         if key in (10, 13, curses.KEY_ENTER):
-            state.filter = text.strip()
+            state.set_filter(text.strip())
             break
         if key == 27:
+            # The escape key gives the filter up: the map shows every
+            # flow again.
+            state.set_filter("")
             break
         if key in (curses.KEY_BACKSPACE, 127, 8):
             text = text[:-1]
@@ -1103,23 +1314,6 @@ def _read_filter(
         redraw()
     state.filter_input = None
     stdscr.nodelay(True)
-
-
-def _apply_filter(state: _State, now: float) -> None:
-    """Take the peers of the flows the filter leaves out away.
-
-    The filter is about the map: the flows that do not hold the name of
-    the filter are not on it any more.
-
-    Args:
-        state: What the interface knows.
-        now: The moment, in seconds.
-    """
-    if not state.filter:
-        return
-    for key, info in state.flows.items():
-        if state.filter not in info.label.rsplit(":", 1)[0]:
-            state.animator.handle_event(Closed(key=key), now)
 
 
 def _loop(
@@ -1142,17 +1336,22 @@ def _loop(
     curses.curs_set(0)
     curses.noecho()
     stdscr.keypad(True)
-    stdscr.timeout(max(1, 1000 // cfg.fps))
+    # The screen is read without waiting: the timeout of the screen
+    # would be of no use, the frame is drawn by the clock of the
+    # program and not by the keys.
     stdscr.nodelay(True)
     _init_colours()
 
     state = _State(cfg)
     rows, cols = stdscr.getmaxyx()
     map_ = _Map(cfg, cols, rows)
-    events: "queue.Queue[tuple[list[FlowEvent], Stats, float]]" = queue.Queue()
+    events: "queue.Queue[tuple[list[FlowEvent], list[Flow], Stats, float]]" = (
+        queue.Queue()
+    )
     stop = threading.Event()
     table = FlowTable(resolver, poll_ms=cfg.poll_ms)
     collector_thread = _CollectorThread(collector, table, events, cfg.poll_ms, stop)
+    state.collector = collector_thread
     collector_thread.start()
 
     anchor_holder: list[tuple[Geo | None, float | None]] = []
@@ -1185,7 +1384,6 @@ def _loop(
                     stdscr, map_, state, events, time.monotonic(), anchor_holder
                 ),
             )
-            _apply_filter(state, time.monotonic())
             continue
         running = _handle_key(key, state, map_)
     stop.set()
@@ -1225,7 +1423,7 @@ def _draw(
     stdscr: "curses.window",
     map_: _Map,
     state: _State,
-    events: "queue.Queue[tuple[list[FlowEvent], Stats, float]]",
+    events: "queue.Queue[tuple[list[FlowEvent], list[Flow], Stats, float]]",
     now: float,
     anchor_holder: list[tuple[Geo | None, float | None]],
 ) -> None:
@@ -1261,22 +1459,31 @@ def _draw(
         state.animator.anchor = geo
         map_.anchor = geo
 
+    state.read_error()
+
     batch: list[FlowEvent] = []
+    flows: list[Flow] | None = None
+    stats: Stats | None = None
     while True:
         try:
-            events_now, stats, _ = events.get_nowait()
+            events_now, flows_now, stats_now, _ = events.get_nowait()
         except queue.Empty:
             break
         batch.extend(events_now)
-        state.stats = stats
+        flows = flows_now
+        stats = stats_now
 
-    for event in batch:
-        state.remember(event)
+    if flows is not None and stats is not None:
+        # The flows of the table are the truth of the map: they are
+        # filtered again here, for the numbers of the status bar.
+        state.update(flows, stats)
+
     if not state.paused:
         state.now = now
         for event in batch:
-            if not state.matches(event):
-                continue
+            # Every event is taken into account, even the ones of the
+            # flows the filter leaves out: their peers are kept, so
+            # that they come back when the filter is removed.
             state.animator.handle_event(event, now)
     # The expired comets and peers are taken away at every frame, so
     # that they do not pile up.
@@ -1312,7 +1519,7 @@ def run(cfg: Config) -> int:
         print("tmap: run 'make assets' to download the map", file=sys.stderr)
         return 2
     try:
-        collector = _make_collector(cfg)
+        collector = make_collector(cfg)
     except OSError as exc:
         print(f"tmap: cannot read the recording: {exc}", file=sys.stderr)
         return 2
@@ -1355,7 +1562,7 @@ def snapshot(cfg: Config, path: Path, frames: int) -> int:
         print("tmap: run 'make assets' to download the map", file=sys.stderr)
         return 2
     try:
-        collector = _make_collector(cfg)
+        collector = make_collector(cfg)
     except OSError as exc:
         print(f"tmap: cannot read the recording: {exc}", file=sys.stderr)
         return 2
@@ -1374,20 +1581,26 @@ def snapshot(cfg: Config, path: Path, frames: int) -> int:
 
     frame: _Frame | None = None
     previous: float | None = None
+    events: list[FlowEvent] = []
     for _ in range(max(1, frames)):
         now = clock()
-        rows = collector.poll()
-        events: list[FlowEvent] = []
-        if previous is None or now != previous:
-            events = table.update(rows, now)
-            previous = now
-        for event in events:
-            state.remember(event)
-            if state.matches(event):
+        try:
+            rows = collector.poll()
+        except Exception as exc:  # noqa: BLE001 - the map must survive
+            # The collector is down: the last frame stays on the
+            # screen and the error is shown in the status bar.
+            log.info("cannot read the sockets: %s", exc)
+            state.error = _error_text(exc)
+        else:
+            state.error = None
+            if previous is None or now != previous:
+                events = table.update(rows, now)
+                previous = now
+            for event in events:
                 state.animator.handle_event(event, now)
+            state.update(table.flows(), table.stats())
         state.now = now
         state.animator.prune(state.now)
-        state.stats = table.stats()
         frame = _render(map_, state, state.now, state.stats)
 
     if frame is None:  # pragma: no cover - the loop always runs once
