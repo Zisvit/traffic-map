@@ -16,10 +16,14 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 ASSETS = Path(__file__).resolve().parents[2] / "assets"
+DEFAULT_CONFIG_RELATIVE = Path("trafficmap") / "config.toml"
 
 
 def default_cache_dir() -> Path:
-    base = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
+    try:
+        base = os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache"
+    except (RuntimeError, KeyError) as exc:
+        raise ValueError(f"cannot determine cache directory: {exc}") from exc
     return Path(base) / "trafficmap"
 
 
@@ -54,9 +58,13 @@ _FALSE_VALUES = frozenset({"0", "false", "no"})
 
 def load_config(argv: list[str] | None = None, path: Path | None = None) -> Config:
     """Build a Config from defaults, TOML, environment, and CLI arguments."""
-    config_path = (
-        Path(path).expanduser() if path is not None else _default_config_path()
-    )
+    if path is None:
+        config_path = _default_config_path()
+    else:
+        try:
+            config_path = Path(path).expanduser()
+        except (RuntimeError, KeyError) as exc:
+            raise ValueError(f"cannot expand config path {path!r}: {exc}") from exc
 
     values: dict[str, object] = dict(_read_toml(config_path))
     values.update(_env_values())
@@ -66,8 +74,13 @@ def load_config(argv: list[str] | None = None, path: Path | None = None) -> Conf
 
 
 def _default_config_path() -> Path:
-    base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    return base / "trafficmap" / "config.toml"
+    try:
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    except (RuntimeError, KeyError) as exc:
+        raise ValueError(
+            f"cannot determine config directory for {DEFAULT_CONFIG_RELATIVE}: {exc}"
+        ) from exc
+    return base / DEFAULT_CONFIG_RELATIVE
 
 
 def _read_toml(path: Path) -> dict[str, object]:

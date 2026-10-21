@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from trafficmap.config import ASSETS, Config, load_config
+from trafficmap.config import ASSETS, Config, _default_config_path, load_config
 
 
 @pytest.fixture(autouse=True)
@@ -186,6 +186,27 @@ def test_default_path_uses_xdg_config_home(tmp_path, monkeypatch):
     (config_dir / "trafficmap" / "config.toml").write_text("fps = 5\n")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(config_dir))
     assert load_config([]).fps == 5
+
+
+def test_empty_xdg_config_home_falls_back_to_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", "")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config_dir = tmp_path / ".config" / "trafficmap"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.toml").write_text("fps = 5\n")
+
+    path = _default_config_path()
+    assert path.is_absolute()
+    assert path.parts[-3:] == (".config", "trafficmap", "config.toml")
+    assert path == tmp_path / ".config" / "trafficmap" / "config.toml"
+    assert load_config([]).fps == 5
+
+
+def test_unexpandable_config_path_raises_value_error():
+    with pytest.raises(ValueError) as excinfo:
+        load_config([], path=Path("~nosuchuser12345/x.toml"))
+    assert not isinstance(excinfo.value, RuntimeError)
+    assert "nosuchuser12345" in str(excinfo.value)
 
 
 def test_cache_dir_uses_xdg_cache_home(tmp_path, monkeypatch):
