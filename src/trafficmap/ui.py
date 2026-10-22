@@ -95,7 +95,7 @@ from trafficmap.flows import (
 )
 from trafficmap.geo import Geo, GeoResolver
 from trafficmap.projection import Viewport, project, unproject
-from trafficmap.worldmap import load_land
+from trafficmap.worldmap import load_geojson, load_land, rasterize
 
 __all__ = ["make_collector", "run", "snapshot"]
 
@@ -116,12 +116,26 @@ MIN_ROWS = 24
 SNAPSHOT_COLS = 80
 SNAPSHOT_ROWS = 24
 
-#: The span of the world each zoom level shows.
-ZOOM_SPANS: dict[int, tuple[float, float]] = {
-    1: (360.0, 180.0),
-    2: (120.0, 60.0),
-    3: (30.0, 20.0),
+#: The span of the world at the first zoom level.
+WORLD_SPAN: tuple[float, float] = (360.0, 180.0)
+
+#: The zoom factor of the preset keys ``1``, ``2`` and ``3``: the span
+#: of the world is divided by it.
+ZOOM_PRESETS: dict[int, float] = {
+    1: 1.0,
+    2: 3.0,
+    3: 12.0,
 }
+
+#: The smallest zoom factor: the whole world.
+MIN_ZOOM = 1.0
+
+#: The greatest zoom factor: a span of three degrees of longitude, some
+#: three hundred kilometres, where the scatter of a city is seen.
+MAX_ZOOM = 120.0
+
+#: The factor one step of the zoom keys and of the wheel changes.
+ZOOM_STEP = 1.25
 
 #: Number of lines of the panel of the busiest flows.
 TOP_PANEL_ROWS = 8
@@ -149,8 +163,9 @@ HELP_LINES = (
     " keys",
     " q  quit            space  pause the map",
     " t  busiest flows   l  country labels",
-    " 1 2 3  zoom        f  filter by process",
-    " ?  this help       esc  cancels the filter",
+    " 1 2 3  zoom        + -  finer zoom",
+    " f  filter a process 0  whole world",
+    " ?  this help       esc  clears the filter",
 )
 
 
@@ -442,7 +457,12 @@ class _Map:
 
     def __init__(self, cfg: Config, cols: int, rows: int) -> None:
         self._cfg = cfg
-        self.zoom = 1
+        #: The zoom factor: the span of the world is divided by it.
+        self.zoom = MIN_ZOOM
+        #: The place the view is centred on, or ``None`` to follow the
+        #: anchor.  A zoom around a point of the screen moves it away
+        #: from the anchor, and the map stays there.
+        self.center: tuple[float, float] | None = None
         self.anchor: Geo | None = None
         self.cols = cols
         self.rows = rows
@@ -450,6 +470,7 @@ class _Map:
         self.canvas = Canvas(cols * 2, self.map_height * 4)
         self._world: bytearray | None = None
         self._world_size = (0, 0)
+        self._geojson: dict | None = None
         self._visible: bytearray | None = None
         self._visible_key: tuple[float, ...] | None = None
 
@@ -467,45 +488,118 @@ class _Map:
         self._visible = None
         self._visible_key = None
 
+    def spans(self) -> tuple[float, float]:
+        """Return the spans of the view at the current zoom.
+
+        Returns:
+            The span of the longitudes and the span of the latitudes,
+            in degrees.
+        """
+        zoom = min(MAX_ZOOM, max(MIN_ZOOM, self.zoom))
+        return (WORLD_SPAN[0] / zoom, WORLD_SPAN[1] / zoom)
+
     def viewport(self) -> Viewport:
         """Return the part of the world the canvas shows.
 
-        The view is centred on the anchor when there is one, but the
+        The view follows the anchor when it has one, and it stays where
+        a zoom around a point of the screen left it otherwise.  The
         centre never leaves the range of the latitudes: a view that
         hangs over the pole shows rows of nothing and cuts the other
         pole off.
 
         Returns:
-            The viewport, centred on the anchor when there is one.
+            The viewport, centred on the anchor when the zoom did not
+            move it.
         """
-        lon_span, lat_span = ZOOM_SPANS.get(self.zoom, ZOOM_SPANS[1])
+        lon_span, lat_span = self.spans()
         center_lat = 0.0
         center_lon = 0.0
-        anchor = self.anchor
-        if anchor is not None and anchor.lat is not None and anchor.lon is not None:
-            center_lat = _clamp_lat(anchor.lat, lat_span)
-            center_lon = anchor.lon
+        if self.center is not None:
+            center_lat, center_lon = self.center
+        else:
+            anchor = self.anchor
+            if anchor is not None and anchor.lat is not None and anchor.lon is not None:
+                center_lat = anchor.lat
+                center_lon = anchor.lon
+        if center_lon < -180.0 or center_lon >= 180.0:
+            center_lon = (center_lon + 180.0) % 360.0 - 180.0
         return Viewport(
             width=self.canvas.width,
             height=self.canvas.height,
-            center_lat=center_lat,
+            center_lat=_clamp_lat(center_lat, lat_span),
             center_lon=center_lon,
             lon_span=lon_span,
             lat_span=lat_span,
         )
 
+    def set_zoom(self, zoom: float) -> None:
+        """Set the zoom factor and centre the view on the anchor again.
+
+        Args:
+            zoom: The zoom factor: the span of the world is divided by
+                it.  A factor out of the limits is brought back into
+                them.
+        """
+        self.zoom = min(MAX_ZOOM, max(MIN_ZOOM, zoom))
+        self.center = None
+        self._visible = None
+        self._visible_key = None
+
+    def reset_zoom(self) -> None:
+        """Show the whole world again, centred on the anchor."""
+        self.set_zoom(MIN_ZOOM)
+
+    def zoom_by(self, factor: float, cursor: tuple[int, int] | None = None) -> None:
+        """Zoom in or out, keeping the point under the cursor in place.
+
+        The point of the world the cursor is on does not move on the
+        screen: the view is moved around it, so that a wheel over a
+        city zooms on that city and not on the middle of the screen.
+
+        Args:
+            factor: The factor the zoom is multiplied by: a factor
+                greater than one zooms in.
+            cursor: The dot of the canvas the zoom is centred on, or
+                ``None`` for the middle of the map.
+
+        Raises:
+            ValueError: If the factor is not positive.
+        """
+        if factor <= 0:
+            raise ValueError(f"zoom factor must be positive, got {factor}")
+        new_zoom = min(MAX_ZOOM, max(MIN_ZOOM, self.zoom * factor))
+        if new_zoom == self.zoom:
+            return
+        old = self.viewport()
+        if cursor is None:
+            cursor = (old.width // 2, old.height // 2)
+        x = min(max(cursor[0], 0), old.width - 1)
+        y = min(max(cursor[1], 0), old.height - 1)
+        lat, lon = unproject(x, y, old)
+        self.zoom = new_zoom
+        lon_span, lat_span = self.spans()
+        # The point of the world stays under the cursor: its place on
+        # the screen is the one of the old view, and the centre moves
+        # by what the new span puts between the cursor and the middle.
+        center_lon = lon - (x / (old.width - 1) - 0.5) * lon_span
+        center_lat = lat - (0.5 - y / (old.height - 1)) * lat_span
+        self.center = (center_lat, center_lon)
+        self._visible = None
+        self._visible_key = None
+
     def land_mask(self) -> bytearray:
         """Return the land of the visible part of the world.
 
-        The whole world is rasterized once, in the size of the canvas.
-        The visible part is taken out of that raster, with the nearest
-        neighbour, so that the map is not rasterized again at every
-        zoom level.
+        The whole world is rasterized once and cached on disk, and the
+        view of the whole world is taken out of that raster.  A zoomed
+        view is rasterized again from the polygons, at the resolution
+        of the canvas: the coast of a zoomed map is as sharp as the
+        dots allow, and it does not show the blocks of the world raster
+        enlarged.
 
         The land is always taken in the frame of the viewport: the
-        viewport is centred on the anchor, so the land of the world is
-        moved with it.  The peers, the comets and the anchor are
-        placed in that same frame, and the land has to be there too.
+        peers, the comets and the anchor are placed in that same frame,
+        and the land has to be there too.
 
         Returns:
             One byte per dot of the canvas: ``1`` for land, ``0`` for
@@ -515,23 +609,36 @@ class _Map:
         key = (
             float(self.canvas.width),
             float(self.canvas.height),
-            viewport.lon_span,
-            viewport.lat_span,
+            round(viewport.lon_span, 9),
+            round(viewport.lat_span, 9),
             round(viewport.center_lat, 6),
             round(viewport.center_lon, 6),
         )
         if self._visible is not None and self._visible_key == key:
             return self._visible
-        world = self._world_mask()
-        if _shows_the_whole_world(viewport):
-            # The raster of the world is already the visible part: the
-            # viewport is the one of the world, dot for dot.
-            visible = world
+        if viewport.lon_span >= WORLD_SPAN[0] and viewport.lat_span >= WORLD_SPAN[1]:
+            visible = self._world_mask()
+            if not _shows_the_whole_world(viewport):
+                visible = _sample_mask(visible, viewport)
         else:
-            visible = _sample_mask(world, viewport)
+            visible = self._zoom_mask(viewport)
         self._visible = visible
         self._visible_key = key
         return visible
+
+    def _zoom_mask(self, viewport: Viewport) -> bytearray:
+        """Return the land of a zoomed view, drawn from the polygons.
+
+        Args:
+            viewport: The part of the world the canvas shows.
+
+        Returns:
+            One byte per dot of the canvas: ``1`` for land, ``0`` for
+            water.
+        """
+        if self._geojson is None:
+            self._geojson = load_geojson(self._cfg.land_geojson)
+        return rasterize(self._geojson, self.canvas.width, self.canvas.height, viewport)
 
     def _world_mask(self) -> bytearray:
         """Return the raster of the whole world, in the size of the canvas."""
@@ -709,6 +816,22 @@ def _format_rate(value: float) -> str:
         if number < scale * 1000.0:
             return f"{number / scale:.1f} {unit}/s"
     return f"{number / _RATE_UNITS[-1][1]:.1f} PB/s"
+
+
+def _format_zoom(zoom: float) -> str:
+    """Format the zoom factor for the status bar.
+
+    Args:
+        zoom: The zoom factor.
+
+    Returns:
+        The factor, ``"x3"`` for a preset and ``"x1.6"`` for a step of
+        the wheel.
+    """
+    rounded = round(zoom)
+    if abs(zoom - rounded) < 0.05:
+        return f"x{rounded}"
+    return f"x{zoom:.1f}"
 
 
 def _format_packets(value: float) -> str:
@@ -1250,8 +1373,8 @@ def _status_lines(
     if not _is_root():
         parts.append(("no root: only your sockets", _C_WARNING))
     parts.append((state.anchor_text, _C_DEFAULT))
-    if map_.zoom != 1:
-        parts.append((f"zoom {map_.zoom}", _C_DEFAULT))
+    if map_.zoom > MIN_ZOOM:
+        parts.append((f"zoom {_format_zoom(map_.zoom)}", _C_DEFAULT))
     if state.filter_input is not None:
         parts.append((f"filter: {state.filter_input}", _C_DEFAULT))
     elif state.filter:
@@ -1588,7 +1711,13 @@ def _handle_key(key: int, state: _State, map_: _Map) -> bool:
     elif key == ord("?"):
         state.show_help = not state.show_help
     elif key in (ord("1"), ord("2"), ord("3")):
-        map_.zoom = key - ord("0")
+        map_.set_zoom(ZOOM_PRESETS[key - ord("0")])
+    elif key in (ord("+"), ord("=")):
+        map_.zoom_by(ZOOM_STEP)
+    elif key in (ord("-"), ord("_")):
+        map_.zoom_by(1.0 / ZOOM_STEP)
+    elif key == ord("0"):
+        map_.reset_zoom()
     elif key == 27:
         # The escape key gives the filter up: every flow is on the map
         # again, and the status bar does not show a filter any more.
@@ -1645,6 +1774,32 @@ def _read_filter(
     stdscr.nodelay(True)
 
 
+def _zoom_with_mouse(map_: _Map, event: tuple[int, int, int, int, int]) -> None:
+    """Zoom the map in or out with the wheel of the mouse.
+
+    The wheel zooms around the point under the pointer: the city under
+    the mouse stays under the mouse.  A wheel that is not on the map
+    zooms around the middle of the map.
+
+    Args:
+        map_: The map to zoom.
+        event: The event of the mouse, as ``curses.getmouse`` returns
+            it: the id, the column, the line, the state of the buttons
+            and the buttons.
+    """
+    _, mouse_x, mouse_y, _, buttons = event
+    if mouse_y >= map_.map_height:
+        cursor = None
+    else:
+        # A character cell of the map holds two dots in width and four
+        # in height.
+        cursor = (mouse_x * 2, mouse_y * 4)
+    if buttons & curses.BUTTON4_PRESSED:
+        map_.zoom_by(ZOOM_STEP, cursor)
+    elif buttons & curses.BUTTON5_PRESSED:
+        map_.zoom_by(1.0 / ZOOM_STEP, cursor)
+
+
 def _loop(
     stdscr: "curses.window",
     cfg: Config,
@@ -1669,6 +1824,12 @@ def _loop(
     # would be of no use, the frame is drawn by the clock of the
     # program and not by the keys.
     stdscr.nodelay(True)
+    # The wheel of the mouse zooms the map.  A terminal that has no
+    # mouse reports no events, and the keys are enough.
+    try:
+        curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+    except curses.error:
+        log.debug("the terminal has no mouse")
     _init_colours()
 
     state = _State(cfg)
@@ -1702,6 +1863,13 @@ def _loop(
         if key == curses.KEY_RESIZE:
             rows, cols = stdscr.getmaxyx()
             map_.resize(cols, rows)
+            continue
+        if key == curses.KEY_MOUSE:
+            try:
+                event = curses.getmouse()
+            except curses.error:
+                continue
+            _zoom_with_mouse(map_, event)
             continue
         if key == ord("f"):
             _read_filter(

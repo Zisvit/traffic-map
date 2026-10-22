@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from trafficmap.worldmap import load_land, rasterize
+from trafficmap.projection import Viewport
+from trafficmap.worldmap import load_geojson, load_land, rasterize
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SAMPLE = FIXTURES / "land_sample.geojson"
@@ -234,3 +235,136 @@ def test_stale_cache_files_are_removed(tmp_path):
     assert current.exists()
     # The cache of another resolution is still in use.
     assert other.exists()
+
+
+# -- the viewports of the zoom ------------------------------------------
+
+
+def _viewport_index(
+    lon: float, lat: float, viewport: Viewport
+) -> int:
+    """Return the index of a coordinate in the mask of a viewport.
+
+    The longitude is wrapped around the centre of the view, the way
+    :func:`trafficmap.projection.project` wraps it.
+    """
+    dlon = (lon - viewport.center_lon + 180.0) % 360.0 - 180.0
+    x = int((dlon / viewport.lon_span + 0.5) * (viewport.width - 1) + 0.5)
+    y = int(
+        (0.5 - (lat - viewport.center_lat) / viewport.lat_span)
+        * (viewport.height - 1)
+        + 0.5
+    )
+    assert 0 <= x < viewport.width, f"x={x} is outside the mask"
+    assert 0 <= y < viewport.height, f"y={y} is outside the mask"
+    return y * viewport.width + x
+
+
+def test_a_viewport_draws_the_part_it_shows():
+    """A view of the small square shows the square and nothing else."""
+    geojson = _load(SAMPLE)
+    viewport = Viewport(
+        width=WIDTH,
+        height=HEIGHT,
+        center_lat=0.0,
+        center_lon=0.0,
+        lon_span=6.0,
+        lat_span=3.0,
+    )
+    mask = rasterize(geojson, WIDTH, HEIGHT, viewport)
+    assert len(mask) == WIDTH * HEIGHT
+    assert mask[_viewport_index(0.0, 0.0, viewport)] == 1
+    # The edge of the square is at one degree: just outside it is water.
+    assert mask[_viewport_index(1.5, 0.0, viewport)] == 0
+
+
+@pytest.mark.skipif(not REAL_LAND.exists(), reason="assets/land.geojson is missing")
+def test_a_zoom_of_a_known_place_is_land():
+    """A narrow view of Europe has Berlin on land and the Baltic in water."""
+    geojson = load_geojson(REAL_LAND)
+    viewport = Viewport(
+        width=200,
+        height=100,
+        center_lat=50.0,
+        center_lon=10.0,
+        lon_span=20.0,
+        lat_span=10.0,
+    )
+    mask = rasterize(geojson, 200, 100, viewport)
+    assert mask[_viewport_index(13.4, 52.5, viewport)] == 1
+    assert mask[_viewport_index(13.0, 54.5, viewport)] == 0
+
+
+def test_a_viewport_over_the_antimeridian_draws_both_sides():
+    """The land of the two sides of the antimeridian is drawn where it is."""
+    east = {
+        "type": "Feature",
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [
+                [[170.0, 10.0], [180.0, 10.0], [180.0, 30.0], [170.0, 30.0], [170.0, 10.0]]
+            ],
+        },
+    }
+    west = {
+        "type": "Feature",
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [
+                [
+                    [-180.0, -30.0],
+                    [-170.0, -30.0],
+                    [-170.0, -10.0],
+                    [-180.0, -10.0],
+                    [-180.0, -30.0],
+                ]
+            ],
+        },
+    }
+    geojson = {"type": "FeatureCollection", "features": [east, west]}
+    viewport = Viewport(
+        width=WIDTH,
+        height=HEIGHT,
+        center_lat=0.0,
+        center_lon=180.0,
+        lon_span=40.0,
+        lat_span=80.0,
+    )
+    mask = rasterize(geojson, WIDTH, HEIGHT, viewport)
+    assert mask[_viewport_index(175.0, 20.0, viewport)] == 1
+    assert mask[_viewport_index(-175.0, -20.0, viewport)] == 1
+    assert mask[_viewport_index(165.0, 0.0, viewport)] == 0
+
+
+def test_a_viewport_does_not_borrow_the_land_of_the_other_side():
+    """A view that stays on one side does not draw the polygons of the other."""
+    east = {
+        "type": "Feature",
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [
+                [[170.0, 10.0], [180.0, 10.0], [180.0, 30.0], [170.0, 30.0], [170.0, 10.0]]
+            ],
+        },
+    }
+    geojson = {"type": "FeatureCollection", "features": [east]}
+    viewport = Viewport(
+        width=WIDTH,
+        height=HEIGHT,
+        center_lat=0.0,
+        center_lon=0.0,
+        lon_span=40.0,
+        lat_span=80.0,
+    )
+    mask = rasterize(geojson, WIDTH, HEIGHT, viewport)
+    assert set(mask) == {0}
+
+
+def test_a_viewport_needs_a_positive_span():
+    with pytest.raises(ValueError):
+        rasterize(
+            _load(SAMPLE),
+            WIDTH,
+            HEIGHT,
+            Viewport(width=WIDTH, height=HEIGHT, lon_span=0.0, lat_span=10.0),
+        )

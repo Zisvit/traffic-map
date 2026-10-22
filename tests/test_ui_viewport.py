@@ -18,7 +18,8 @@ from trafficmap.ui import (
     SNAPSHOT_COLS,
     SNAPSHOT_ROWS,
     STATUS_ROWS,
-    ZOOM_SPANS,
+    WORLD_SPAN,
+    ZOOM_PRESETS,
     _Map,
     _State,
     _draw,
@@ -108,7 +109,7 @@ def make_map(anchor: Geo | None, zoom: int) -> _Map:
     """
     map_ = _Map(Config(), SNAPSHOT_COLS, SNAPSHOT_ROWS)
     map_.anchor = anchor
-    map_.zoom = zoom
+    map_.zoom = ZOOM_PRESETS[zoom]
     return map_
 
 
@@ -140,7 +141,7 @@ def draw_live(anchor: Geo, zoom: int) -> FakeScreen:
     cfg = Config()
     state = _State(cfg)
     map_ = _Map(cfg, SNAPSHOT_COLS, SNAPSHOT_ROWS)
-    map_.zoom = zoom
+    map_.zoom = ZOOM_PRESETS[zoom]
     screen = FakeScreen(SNAPSHOT_ROWS, SNAPSHOT_COLS)
     _draw(screen, map_, state, queue.Queue(), 0.0, [(anchor, None)])
     return screen
@@ -155,7 +156,7 @@ def test_the_view_of_the_world_shows_the_whole_world():
     """
     map_ = make_map(ANCHOR, 1)
     viewport = map_.viewport()
-    assert viewport.lat_span == ZOOM_SPANS[1][1] == 180.0
+    assert viewport.lat_span == WORLD_SPAN[1] == 180.0
     assert viewport.center_lat == 0.0
     bottom, top = visible_latitudes(viewport)
     assert -90.0 <= bottom <= top <= 90.0
@@ -168,7 +169,7 @@ def test_the_anchor_is_the_centre_of_the_view_when_it_fits():
     """A view that fits around the anchor is centred on it."""
     map_ = make_map(ANCHOR, 3)
     viewport = map_.viewport()
-    assert viewport.lat_span == ZOOM_SPANS[3][1] == 20.0
+    assert viewport.lat_span == WORLD_SPAN[1] / ZOOM_PRESETS[3] == 15.0
     assert viewport.center_lat == ANCHOR.lat == 52.4
     assert project(ANCHOR.lat, ANCHOR.lon, viewport) is not None
 
@@ -183,7 +184,7 @@ def test_the_centre_of_the_view_slides_to_the_anchor_near_the_pole():
     """
     map_ = make_map(POLAR_ANCHOR, 3)
     viewport = map_.viewport()
-    assert viewport.center_lat == 80.0
+    assert viewport.center_lat == 82.5
     assert project(POLAR_ANCHOR.lat, POLAR_ANCHOR.lon, viewport) is not None
     bottom, top = visible_latitudes(viewport)
     assert -90.0 <= bottom <= top <= 90.0

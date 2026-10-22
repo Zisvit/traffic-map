@@ -6,6 +6,7 @@ over the sea.  These tests use the helpers of the interface itself and
 not a copy of them.
 """
 
+import curses
 import queue
 import threading
 import time
@@ -29,13 +30,16 @@ from trafficmap.collector_pcap import Burst
 from trafficmap.config import Config
 from trafficmap.flows import Flow, FlowTable, Opened, Stats
 from trafficmap.geo import Geo, GeoResolver
-from trafficmap.projection import great_circle, project
+from trafficmap.projection import great_circle, project, unproject
 from trafficmap.ui import (
     RETRY_FIRST,
     RETRY_MAX,
     SNAPSHOT_COLS,
     SNAPSHOT_ROWS,
-    ZOOM_SPANS,
+    MIN_ZOOM,
+    ZOOM_PRESETS,
+    ZOOM_STEP,
+    WORLD_SPAN,
     _ASCII_GLYPHS,
     _C_IN,
     _C_WARNING,
@@ -50,6 +54,7 @@ from trafficmap.ui import (
     _status_lines,
     _text_rows,
     _top_panel,
+    _zoom_with_mouse,
 )
 
 ASSETS = Path(__file__).resolve().parents[1] / "assets"
@@ -113,7 +118,7 @@ def make_map(anchor: Geo | None = None, zoom: int = 1) -> _Map:
     """
     map_ = _Map(Config(), SNAPSHOT_COLS, SNAPSHOT_ROWS)
     map_.anchor = anchor
-    map_.zoom = zoom
+    map_.zoom = ZOOM_PRESETS[zoom]
     return map_
 
 
@@ -405,15 +410,18 @@ def test_the_anchor_and_a_peer_of_the_machine_are_on_the_land():
 
 
 def test_the_zoom_changes_the_span_of_the_viewport():
-    """Every zoom level shows another part of the world."""
+    """Every preset shows another part of the world."""
     map_ = make_map(ANCHOR, 1)
     spans = []
     for zoom in (1, 2, 3):
-        map_.zoom = zoom
+        map_.set_zoom(ZOOM_PRESETS[zoom])
         viewport = map_.viewport()
         spans.append((viewport.lon_span, viewport.lat_span))
-    assert spans == [(360.0, 180.0), (120.0, 60.0), (30.0, 20.0)]
-    assert spans == [ZOOM_SPANS[1], ZOOM_SPANS[2], ZOOM_SPANS[3]]
+    assert spans == [(360.0, 180.0), (120.0, 60.0), (30.0, 15.0)]
+    assert spans == [
+        (WORLD_SPAN[0] / factor, WORLD_SPAN[1] / factor)
+        for factor in ZOOM_PRESETS.values()
+    ]
     # The viewport stays on the anchor, at every zoom level.
     assert map_.viewport().center_lat == ANCHOR.lat
     assert map_.viewport().center_lon == ANCHOR.lon
@@ -424,8 +432,64 @@ def test_the_zoom_shows_another_land():
     map_ = make_map(ANCHOR, 1)
     first = bytes(map_.land_mask())
     for zoom in (2, 3):
-        map_.zoom = zoom
+        map_.set_zoom(ZOOM_PRESETS[zoom])
         assert bytes(map_.land_mask()) != first
+
+
+def test_the_zoom_steps_are_continuous():
+    """A step of the keys divides the span by the step of the zoom."""
+    map_ = make_map(ANCHOR, 1)
+    before = map_.viewport()
+    map_.zoom_by(ZOOM_STEP)
+    after = map_.viewport()
+    assert after.lon_span == pytest.approx(before.lon_span / ZOOM_STEP)
+    assert after.lat_span == pytest.approx(before.lat_span / ZOOM_STEP)
+    map_.zoom_by(1.0 / ZOOM_STEP)
+    assert map_.viewport().lon_span == pytest.approx(before.lon_span)
+
+
+def test_the_zoom_stops_at_the_limits():
+    """The zoom cannot go under the world and not past its limit."""
+    map_ = make_map(ANCHOR, 1)
+    for _ in range(100):
+        map_.zoom_by(1.0 / ZOOM_STEP)
+    assert map_.zoom == MIN_ZOOM
+    for _ in range(200):
+        map_.zoom_by(ZOOM_STEP)
+    assert map_.zoom == pytest.approx(120.0)
+    assert map_.viewport().lon_span == pytest.approx(WORLD_SPAN[0] / 120.0)
+
+
+def test_a_zoom_keeps_the_point_of_the_cursor_in_place():
+    """The city under the mouse stays under the mouse."""
+    map_ = make_map(ANCHOR, 1)
+    cursor = (map_.canvas.width // 3, map_.canvas.height // 3)
+    before = unproject(cursor[0], cursor[1], map_.viewport())
+    map_.zoom_by(ZOOM_STEP, cursor)
+    after = unproject(cursor[0], cursor[1], map_.viewport())
+    assert after[0] == pytest.approx(before[0], abs=1e-6)
+    assert after[1] == pytest.approx(before[1], abs=1e-6)
+
+
+def test_a_preset_takes_the_view_back_to_the_anchor():
+    """A preset centres the view on the anchor again, after a wheel zoom."""
+    map_ = make_map(ANCHOR, 1)
+    map_.zoom_by(ZOOM_STEP, (0, 0))
+    assert map_.center is not None
+    map_.set_zoom(ZOOM_PRESETS[2])
+    assert map_.center is None
+    assert map_.viewport().center_lat == ANCHOR.lat
+    assert map_.viewport().center_lon == ANCHOR.lon
+
+
+def test_the_zero_key_shows_the_whole_world_again():
+    """The key ``0`` goes back to the world, wherever the view was."""
+    map_ = make_map(ANCHOR, 3)
+    map_.zoom_by(ZOOM_STEP, (0, 0))
+    map_.reset_zoom()
+    assert map_.zoom == MIN_ZOOM
+    assert map_.center is None
+    assert map_.viewport().lon_span == WORLD_SPAN[0]
 
 
 def test_a_failing_collector_does_not_kill_the_thread():
@@ -790,3 +854,53 @@ def test_the_status_bar_shows_the_rate_of_the_packets():
     lines = _status_lines(map_, state, state.stats)
     text = "".join(part for part, _ in lines[0])
     assert "1.2k pkt/s" in text
+
+
+# -- the keys and the wheel of the zoom ---------------------------------
+
+
+def test_the_zoom_keys_step_and_reset_the_map():
+    """The keys step the zoom, and the key ``0`` goes back to the world."""
+    state = _State(Config())
+    map_ = make_map(ANCHOR, 1)
+    before = map_.viewport().lon_span
+    assert _handle_key(ord("+"), state, map_) is True
+    assert map_.viewport().lon_span == pytest.approx(before / ZOOM_STEP)
+    assert _handle_key(ord("="), state, map_) is True
+    assert map_.viewport().lon_span == pytest.approx(before / ZOOM_STEP**2)
+    assert _handle_key(ord("-"), state, map_) is True
+    assert map_.viewport().lon_span == pytest.approx(before / ZOOM_STEP)
+    assert _handle_key(ord("0"), state, map_) is True
+    assert map_.zoom == MIN_ZOOM
+    assert map_.viewport().lon_span == before
+    assert _handle_key(ord("3"), state, map_) is True
+    assert map_.zoom == ZOOM_PRESETS[3]
+
+
+def test_the_wheel_zooms_around_the_pointer():
+    """The dot under the pointer stays under the pointer, wheel or not."""
+    map_ = make_map(ANCHOR, 1)
+    column, line = 40, 20
+    dots = (column * 2, line * 4)
+    before = unproject(dots[0], dots[1], map_.viewport())
+    _zoom_with_mouse(map_, (0, column, line, 0, curses.BUTTON4_PRESSED))
+    assert map_.zoom == pytest.approx(ZOOM_STEP)
+    after = unproject(dots[0], dots[1], map_.viewport())
+    assert after[0] == pytest.approx(before[0], abs=1e-6)
+    assert after[1] == pytest.approx(before[1], abs=1e-6)
+    _zoom_with_mouse(map_, (0, column, line, 0, curses.BUTTON5_PRESSED))
+    assert map_.zoom == pytest.approx(MIN_ZOOM)
+
+
+def test_the_wheel_on_the_status_bar_zooms_the_middle():
+    """A wheel that is not on the map does not move the point of the map."""
+    map_ = make_map(ANCHOR, 1)
+    middle = (map_.canvas.width // 2, map_.canvas.height // 2)
+    before = unproject(middle[0], middle[1], map_.viewport())
+    _zoom_with_mouse(
+        map_, (0, 5, map_.map_height + 1, 0, curses.BUTTON4_PRESSED)
+    )
+    after = unproject(middle[0], middle[1], map_.viewport())
+    assert map_.zoom == pytest.approx(ZOOM_STEP)
+    assert after[0] == pytest.approx(before[0], abs=1e-6)
+    assert after[1] == pytest.approx(before[1], abs=1e-6)

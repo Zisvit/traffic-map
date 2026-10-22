@@ -38,13 +38,37 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-__all__ = ["rasterize", "load_land"]
+from trafficmap.projection import Viewport
+
+__all__ = ["rasterize", "load_land", "load_geojson"]
 
 #: Translation table that turns the gray pixels of the image into bits.
 _TO_BIT = bytes(1 if value else 0 for value in range(256))
 
 
-def rasterize(geojson: dict, width: int, height: int) -> bytearray:
+def load_geojson(path: Path) -> dict:
+    """Read a GeoJSON document from a file.
+
+    Args:
+        path: Path of the land GeoJSON file.
+
+    Returns:
+        The parsed document.
+
+    Raises:
+        OSError: If the file cannot be read.
+        json.JSONDecodeError: If the file is malformed.
+    """
+    with Path(path).open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def rasterize(
+    geojson: dict,
+    width: int,
+    height: int,
+    viewport: Viewport | None = None,
+) -> bytearray:
     """Rasterize the land polygons of a GeoJSON document.
 
     Only the outer ring of a polygon is filled; interior holes are
@@ -52,34 +76,74 @@ def rasterize(geojson: dict, width: int, height: int) -> bytearray:
     (the inner ring of feature 112), so the Caspian is painted as land:
     82 pixels of a 400x240 mask.
 
+    Without a viewport the mask is the whole world, with the mapping of
+    :func:`trafficmap.projection.project`.  With a viewport the mask is
+    the part of the world the viewport shows, at the resolution of the
+    viewport: the polygons are drawn again for every view, so a zoomed
+    map has the coast where the dots allow it and not the blocks of the
+    world raster enlarged.  A viewport that reaches over the
+    antimeridian draws the polygons once more, shifted by a whole turn
+    of the world, so that the land of the other side is not lost.
+
     Args:
         geojson: GeoJSON document: a ``FeatureCollection`` or a single
             ``Feature``.
         width: Width of the mask in pixels.
         height: Height of the mask in pixels.
+        viewport: The part of the world to draw, or ``None`` for the
+            whole world.
 
     Returns:
         A flat ``bytearray`` of ``width * height`` entries, row-major,
         holding ``1`` for land and ``0`` for water.
 
     Raises:
-        ValueError: If the size is not positive or the document is not a
-            GeoJSON object.
+        ValueError: If the size is not positive, the document is not a
+            GeoJSON object or the viewport has no positive span.
     """
     if width < 1 or height < 1:
         raise ValueError(f"mask size must be positive, got {width}x{height}")
     if not isinstance(geojson, dict):
         raise ValueError(f"expected a GeoJSON object, got {type(geojson).__name__}")
+    if viewport is not None and (viewport.lon_span <= 0 or viewport.lat_span <= 0):
+        raise ValueError(f"viewport must have a positive span, got {viewport}")
     image = Image.new("1", (width, height), 0)
     draw = ImageDraw.Draw(image)
+    shifts = _shifts_of(viewport)
     for feature in _features(geojson):
         for ring in _exterior_rings(feature):
-            points = [_to_pixel(lon, lat, width, height) for lon, lat in ring]
-            if len(points) >= 3:
-                draw.polygon(points, fill=1)
+            for shift in shifts:
+                points = [
+                    _to_pixel(lon, lat, width, height, viewport, shift)
+                    for lon, lat in ring
+                ]
+                if len(points) >= 3:
+                    draw.polygon(points, fill=1)
     # The "1" mode packs eight pixels into a byte, so the image is
     # widened to "L" first to get one byte per pixel.
     return bytearray(image.convert("L").tobytes().translate(_TO_BIT))
+
+
+def _shifts_of(viewport: Viewport | None) -> tuple[float, ...]:
+    """Return the turns of the world a mask has to draw.
+
+    A viewport that stays on one side of the antimeridian draws the
+    polygons once.  A viewport that reaches over it draws them three
+    times, a whole turn of the world to either side, so that a polygon
+    of the other side is drawn where the viewport sees it.
+
+    Args:
+        viewport: The part of the world to draw, or ``None``.
+
+    Returns:
+        The shifts of the longitude, in degrees.
+    """
+    if viewport is None:
+        return (0.0,)
+    center = (viewport.center_lon + 180.0) % 360.0 - 180.0
+    if abs(center) + viewport.lon_span / 2 <= 180.0:
+        return (0.0,)
+    return (-360.0, 0.0, 360.0)
 
 
 def load_land(
@@ -112,8 +176,7 @@ def load_land(
     cached = _read_cache(cache_file, width * height)
     if cached is not None:
         return cached
-    with geojson_path.open("r", encoding="utf-8") as handle:
-        geojson = json.load(handle)
+    geojson = load_geojson(geojson_path)
     mask = rasterize(geojson, width, height)
     _write_cache(cache_file, mask)
     _prune_cache(cache_dir, width, height, cache_file)
@@ -169,21 +232,49 @@ def _exterior_rings(feature: dict) -> list[list[tuple[float, float]]]:
     return rings
 
 
-def _to_pixel(lon: float, lat: float, width: int, height: int) -> tuple[int, int]:
+def _to_pixel(
+    lon: float,
+    lat: float,
+    width: int,
+    height: int,
+    viewport: Viewport | None = None,
+    shift: float = 0.0,
+) -> tuple[int, int]:
     """Map a geographic coordinate onto a pixel of the mask.
+
+    Without a viewport the whole world is the mask and the result is
+    clamped to it.  With a viewport the coordinate is placed on the
+    part of the world the viewport shows, and the result is **not**
+    clamped: a polygon that leaves the mask has to be clipped where it
+    leaves it, or its shape would be painted along the edge of the
+    mask.
 
     Args:
         lon: Longitude in degrees.
         lat: Latitude in degrees.
         width: Width of the mask in pixels.
         height: Height of the mask in pixels.
+        viewport: The part of the world the mask shows, or ``None`` for
+            the whole world.
+        shift: How many degrees to move the coordinate before it is
+            placed, for the copies of the polygons that are drawn on
+            the other side of the antimeridian.
 
     Returns:
-        The ``(x, y)`` pixel, clamped to the mask.
+        The ``(x, y)`` pixel.
     """
-    x = int((lon + 180.0) / 360.0 * (width - 1) + 0.5)
-    y = int((90.0 - lat) / 180.0 * (height - 1) + 0.5)
-    return (min(max(x, 0), width - 1), min(max(y, 0), height - 1))
+    if viewport is None:
+        x = int((lon + 180.0) / 360.0 * (width - 1) + 0.5)
+        y = int((90.0 - lat) / 180.0 * (height - 1) + 0.5)
+        return (min(max(x, 0), width - 1), min(max(y, 0), height - 1))
+    x = int(
+        ((lon + shift - viewport.center_lon) / viewport.lon_span + 0.5) * (width - 1)
+        + 0.5
+    )
+    y = int(
+        (0.5 - (lat - viewport.center_lat) / viewport.lat_span) * (height - 1) + 0.5
+    )
+    return (x, y)
 
 
 def _read_cache(cache_file: Path, size: int) -> bytearray | None:
