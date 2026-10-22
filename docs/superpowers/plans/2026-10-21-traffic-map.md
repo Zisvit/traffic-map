@@ -27,7 +27,7 @@
 | `src/trafficmap/collector_ss.py` | парсер `ss`, запуск опроса |
 | `src/trafficmap/collector_mock.py` | JSONL-реплей |
 | `src/trafficmap/flows.py` | FlowTable, дельты, события, Stats |
-| `src/trafficmap/anim.py` | Comet / Peer / Pulse |
+| `src/trafficmap/anim.py` | Comet / Peer |
 | `src/trafficmap/ui.py` | curses, раскладка, клавиши, snapshot |
 | `src/trafficmap/__main__.py` | сборка зависимостей, запуск |
 | `tests/` | unit + snapshot |
@@ -230,12 +230,16 @@ def test_great_circle_endpoints():
     assert len(pts) == 32
     assert abs(pts[0][0] - 55.75) < 1e-6 and abs(pts[-1][1] + 74.0) < 1e-6
     mid = pts[16]
-    assert 45 < mid[0] < 62 and -45 < mid[1] < -20   # над Атлантикой
+    assert 55 < mid[0] < 70 and -40 < mid[1] < -20   # над Атлантикой
 
 def test_antipodes_do_not_crash():
     pts = great_circle((0, 0), (0, 180), 10)
     assert len(pts) == 10 and all(-90 <= la <= 90 for la, _ in pts)
 ```
+
+Конвенция индексов: `x = int((dlon + lon_span/2) / lon_span * (width - 1) + 0.5)`,
+`y = int((lat_span/2 - (lat - center_lat)) / lat_span * (height - 1) + 0.5)`,
+с клампом в `[0, width-1]` / `[0, height-1]`. `dlon` нормализуется в `[-180, 180]`.
 
 - [ ] **Step 2: Реализовать** по формулам спеки (`project` — floor-индексы, клиппинг;
   `great_circle` — slerp, антиподы через ортогональную ось). `Viewport` получает
@@ -495,7 +499,7 @@ def test_animator_caps_comets():
 
 - [ ] **Step 2: Реализовать** `Comet.head(now)` (индекс по `t`, clip), `trail`
   (12 точек назад), `expired`, `Animator.spawn/prune/draw(canvas, viewport, now)`,
-  `Peer` с TTL 10 с и `Pulse`. Политика спавна: `Opened` → 1 комета; `Updated` →
+  `Peer` с TTL 10 с. Политика спавна: `Opened` → 1 комета; `Updated` →
   комета при `rate > 32 КБ/с`, не чаще одной на флоу за 300 мс; направление по
   большему из `dtx`/`drx`. Лимит 200 комет, старые вытесняются. `draw` кладёт
   голову стилем 6, след — 5/3/2 по возрасту, пиров — стилем 4, anchor — 7.
@@ -579,7 +583,7 @@ sudo .venv/bin/tmap        # глазами: кометы, ресайз, пау�
 - [ ] **Step 1: `--ascii`** — заменить глифы карты на `#`, пиры на `*`, кометы на `+`,
   след на `-`; snapshot-тест с `--ascii` не должен содержать Braille.
 - [ ] **Step 2: no-root баннер** — `os.geteuid() != 0` → жёлтая строка
-  `no root: only your sockets`; в `--dump` добавить поле.
+  `no root: only your sockets`; ~~в `--dump` добавить поле~~ (в дампе такого поля нет).
 - [ ] **Step 3: systemd unit** — `User=root`, `ExecStart=~/Projects/traffic-map/.venv/bin/tmap`,
   `Restart=on-failure`, `StandardInput=tty`, `TTYPath=/dev/tty1` (документировать,
   что проще запускать из shell).
@@ -600,14 +604,90 @@ grep -c $'\u28' /tmp/f.txt
 
 ---
 
+# Phase 2: пакетный уровень, зум, точные координаты
+
+Решения пользователя (2026-10-21): сбор пакетов — **tshark отдельным процессом**;
+координаты — **таблица ASN + детерминированный разброс**; без прав — **откат на `ss`
+с постоянным предупреждением**, карта не пустеет.
+
+## Task 11: Пакетный сборщик (`tshark`)
+
+**Files:** `src/trafficmap/collector_pcap.py`, `tests/test_collector_pcap.py`,
+`src/trafficmap/config.py` (`capture`, `iface`), `src/trafficmap/ui.py`
+(`_FallbackCollector`, `_CollectorThread`).
+
+- `PcapCollector` запускает `tshark -i <iface|default_interface()> -n -l -T fields`
+  с полями `frame.time_epoch, ip.src, ip.dst, ipv6.src, ipv6.dst, ip.proto,
+  ipv6.nxt, ip.len, ipv6.plen, frame.len, tcp.srcport, tcp.dstport,
+  udp.srcport, udp.dstport`; stdout читается построчно в фоновом потоке,
+  stderr — для диагностики.
+- Свои адреса — из `ip -j addr show` (плюс loopback); src свой → исходящий,
+  dst свой → входящий, оба свои → локальный. Размер IPv6 берётся из
+  `ipv6.plen`, протокол — из `ipv6.nxt`, иначе из `frame.len`/`ip.proto`.
+- Кумулятивные счётчики по 5-кортежу, `poll()` отдаёт те же `SocketRow`, что и
+  `SsCollector`; простой > `IDLE_TIMEOUT = 60 с` вытесняет кортеж.
+- `drain_bursts()` отдаёт всплески по пиру с `age` (секунд с последнего пакета)
+  для искр; счётчики пакетов — для `pkt/s`.
+- Имя процесса — из `ss`-таблицы `local_port → (pid, process)`.
+- `NO_PRIVILEGES` и `MISSING_TSHARK` — точные тексты с командой `setcap` /
+  советом установить `tshark`; `PcapCollector` бросает `RuntimeError`.
+- `make_collector`: `capture = "pcap"` (по умолчанию) оборачивается в
+  `_FallbackCollector`; при ошибке старта/первого опроса — `ss` и постоянное
+  предупреждение в статус-баре (`capture error: ... (sockets only)`).
+  `capture = "ss"` — сразу сокеты, без ошибки захвата.
+
+## Task 12: Искры пакетов (Pulse)
+
+- `anim.py`: `Pulse` (TTL 0.7 с, затухание 0.55 с), `STYLE_PULSE = 9` и
+  `STYLE_PULSE_DIM = 8`, пул 400; `Animator.spawn_pulse(geo, weight, now)`;
+  пакет ≥ 8 KiB — крупная искра (2×2).
+- `ui.py`: `_spawn_pulses` из `drain_bursts()`; `pkt/s` — EMA с TTL 2 с
+  (`PACKET_RATE_TTL`), формат `834 pkt/s` / `12.4k pkt/s`; ASCII — `*`,
+  цвет — magenta (13).
+
+## Task 13: Непрерывный зум и резкая карта
+
+- `_Map.zoom` — float 1…120 (`MIN_ZOOM`, `MAX_ZOOM`), шаг 1.25; пресеты
+  `1/2/3` = ×1/×3/×12 (охват 360×180 → 120×60 → 30×15).
+- `+`/`=` и `-`/`_` — шаг, `0` — мир; колесо — `curses.mousemask` +
+  `curses.getmouse`, `BUTTON4/5_PRESSED`, зум вокруг точки под курсором
+  (`zoom_by(factor, cursor)`), центр хранится в `_Map.center`.
+- `worldmap.rasterize(geojson, width, height, viewport=None)` рисует полигоны
+  в кадре вьюпорта (без клампинга, чтобы не размазывать край); вьюпорт через
+  антимеридиан рисуется тремя сдвигами (±360°). `load_geojson()` вынесен.
+- `_Map.land_mask`: мир (охват ≥ 360×180) — из кэша/растра, иначе — растрирование
+  под вьюпорт; кэш ключуется размером, центром и охватом.
+
+## Task 14: Точные координаты (таблица ASN + разброс)
+
+- `src/trafficmap/asn_coords.py`: `Place(city, country, lat, lon)`;
+  `ANYCAST_POPS` — 10 сетей, которые отвечают из многих городов
+  (Cloudflare, Google, Akamai ×2, Fastly, Meta, X, Netflix, Telegram, GitHub),
+  у каждой — список точек присутствия; `nearest_place` выбирает ближайшую
+  к дому, `anycast_place(asn, home)` — вход для резолвера.
+- `GeoResolver.set_home(lat, lon)`; `_lookup_public` подменяет место для
+  anycast-ASN; адрес самой машины (`_anchor_ip`) не подменяется — он там, где
+  база говорит.
+- `SCATTER_DEGREES = 0.15`: `_spread(geo, ip)` сдвигает адрес по sha1(ip) —
+  стабильно между кадрами и запусками; по умолчанию выключен, UI включает
+  (`GeoResolver(..., scatter=True)`), чтобы точка «я» и тесты оставались точными.
+- Документация: разброс — способ рисования, а не точность; для anycast —
+  ближайшая точка присутствия (догадка, зато не другой континент).
+
+---
+
 ## Self-Review
 
 - **Покрытие спеки:** конфиг (T1), проекция (T2), Braille (T3), карта/ассеты (T4),
   гео/anchor (T5), `ss` (T6), флоу/статистика (T7), анимация (T8), UI/snapshot (T9),
-  ascii/no-root/доки (T10). Не-цели не реализуются.
+  ascii/no-root/доки (T10), пакетный сборщик (T11), искры (T12), зум (T13),
+  координаты (T14).
 - **Плейсхолдеров нет:** все шаги содержат команды, код или точные требования.
 - **Согласованность типов:** `SocketRow.remote: tuple[str,int]`, `Geo`, `Flow.key`,
   `Opened/Updated/Closed` используются одинаково в T6–T9. `Canvas` API
   (`set/line/blit_land/cell_char/cell_style`) совпадает в T3 и T9. `Viewport`
   (`width/height/center_lat/center_lon/lon_span/lat_span`) — в T2, T8, T9.
-- **Пробелы:** M5 (eBPF/UDP) сознательно вне плана — backlog из спеки.
+- **Обратная совместимость:** `PcapCollector` реализует тот же `poll() -> list[SocketRow]`,
+  поэтому `FlowTable` и аниматор не меняются; `--capture ss` остаётся рабочим режимом
+  без привилегий.
+- **Пробелы:** eBPF-учёт per-process остаётся вне плана (нет bpftrace/bpftool в системе).

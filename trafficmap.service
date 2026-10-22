@@ -1,0 +1,33 @@
+# Юнит systemd для карты трафика.
+#
+# Внимание: tmap — это TUI, ему нужен настоящий терминал. Служба,
+# запущенная без TTY, не нарисует карту: curses не получит экран.
+# Поэтому запускайте tmap из обычной оболочки, а этот юнит включите
+# только если у вас есть консоль: тогда раскомментируйте TTYPath
+# (например, /dev/tty1) и запускайте на первой виртуальной консоли.
+#
+#   systemctl daemon-reload
+#   systemctl enable --now trafficmap.service
+
+[Unit]
+Description=Traffic map TUI
+Documentation=file:///opt/traffic-map/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# root нужен, чтобы видеть сокеты всех процессов машины: без него
+# ss показывает только собственные сокеты пользователя.
+User=root
+WorkingDirectory=/opt/traffic-map
+ExecStart=/opt/traffic-map/.venv/bin/tmap
+Restart=on-failure
+RestartSec=5
+Environment=TERM=xterm-256color
+StandardOutput=journal
+StandardError=journal
+# TTYPath=/dev/tty1
+
+[Install]
+WantedBy=multi-user.target
