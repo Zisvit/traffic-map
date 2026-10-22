@@ -312,3 +312,8 @@ land_geojson = "assets/land.geojson"
   ([https://www.naturalearthdata.com](https://www.naturalearthdata.com)).
 - Формат баз — MaxMind DB; программа читает и **GeoLite2**, если подставить файлы
   GeoLite2 вместо DB-IP (имена полей совпадают).
+
+## Лицензия
+
+MIT — см. [LICENSE](LICENSE). Сторонние данные и программы сохраняют свои лицензии
+(см. [Атрибуцию](#атрибуция)).
