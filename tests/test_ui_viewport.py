@@ -20,9 +20,11 @@ from trafficmap.ui import (
     STATUS_ROWS,
     WORLD_SPAN,
     ZOOM_PRESETS,
+    _Frame,
     _Map,
     _State,
     _draw,
+    _paint,
     snapshot,
 )
 
@@ -72,6 +74,21 @@ class FakeScreen:
         self.rows = rows
         self.cols = cols
         self.lines: list[str] = [""] * rows
+        self.cursor: tuple[int, int] = (0, 0)
+
+    def move(self, line: int, column: int) -> None:
+        """Move the cursor of the fake terminal.
+
+        Args:
+            line: The line of the cursor.
+            column: The column of the cursor.
+        """
+        self.cursor = (line, column)
+
+    def clrtoeol(self) -> None:
+        """Erase the rest of the line the cursor is on."""
+        line, column = self.cursor
+        self.lines[line] = self.lines[line][:column]
 
     def getmaxyx(self) -> tuple[int, int]:
         """Return the size of the screen.
@@ -95,6 +112,31 @@ class FakeScreen:
 
     def refresh(self) -> None:
         """Draw the screen: there is nothing to draw here."""
+
+
+def test_a_shorter_status_line_clears_the_tail_of_the_old_one(monkeypatch):
+    """The coordinates of a zoom do not stay after the whole world returns."""
+    monkeypatch.setattr("trafficmap.ui._attr", lambda colour: 0)
+    screen = FakeScreen(5, 30)
+    zoomed = _Frame(
+        cols=30,
+        map_height=2,
+        rows=[[("map", 0)], [("map", 0)]],
+        status=[
+            [],
+            [],
+            [("anchor 1.2.3.4 · zoom x12 · at 52.4N 4.9E", 0)],
+        ],
+    )
+    world = _Frame(
+        cols=30,
+        map_height=2,
+        rows=[[("map", 0)], [("map", 0)]],
+        status=[[], [], [("anchor 1.2.3.4", 0)]],
+    )
+    _paint(screen, zoomed)
+    _paint(screen, world)
+    assert screen.lines[4] == "anchor 1.2.3.4"
 
 
 def make_map(anchor: Geo | None, zoom: int) -> _Map:

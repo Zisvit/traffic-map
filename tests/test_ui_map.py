@@ -37,6 +37,7 @@ from trafficmap.ui import (
     SNAPSHOT_COLS,
     SNAPSHOT_ROWS,
     MIN_ZOOM,
+    PAN_FRACTION,
     ZOOM_PRESETS,
     ZOOM_STEP,
     WORLD_SPAN,
@@ -47,7 +48,10 @@ from trafficmap.ui import (
     _FallbackCollector,
     _Map,
     _State,
+    _anchor_overlays,
     _colour_of,
+    _edge_cell,
+    _edge_markers,
     _format_rate,
     _handle_key,
     _in_cells,
@@ -472,15 +476,28 @@ def test_a_zoom_keeps_the_point_of_the_cursor_in_place():
     assert after[1] == pytest.approx(before[1], abs=1e-6)
 
 
-def test_a_preset_takes_the_view_back_to_the_anchor():
-    """A preset centres the view on the anchor again, after a wheel zoom."""
+def test_a_preset_keeps_the_view_where_the_wheel_left_it():
+    """A preset zooms the place on the screen, not the place of the anchor."""
     map_ = make_map(ANCHOR, 1)
     map_.zoom_by(ZOOM_STEP, (0, 0))
     assert map_.center is not None
+    center = map_.center
     map_.set_zoom(ZOOM_PRESETS[2])
+    assert map_.center == center
+    assert map_.viewport().center_lat == pytest.approx(center[0])
+    assert map_.viewport().center_lon == pytest.approx(center[1])
+
+
+def test_the_c_key_takes_the_view_back_to_the_anchor():
+    """The key ``c`` recentres a view that the arrows or the wheel moved."""
+    map_ = make_map(ANCHOR, 2)
+    map_.pan(0.5, 0.25)
+    assert map_.center is not None
+    map_.recenter()
     assert map_.center is None
-    assert map_.viewport().center_lat == ANCHOR.lat
-    assert map_.viewport().center_lon == ANCHOR.lon
+    assert map_.viewport().center_lat == pytest.approx(ANCHOR.lat)
+    assert map_.viewport().center_lon == pytest.approx(ANCHOR.lon)
+    assert map_.zoom == ZOOM_PRESETS[2]
 
 
 def test_the_zero_key_shows_the_whole_world_again():
@@ -491,6 +508,103 @@ def test_the_zero_key_shows_the_whole_world_again():
     assert map_.zoom == MIN_ZOOM
     assert map_.center is None
     assert map_.viewport().lon_span == WORLD_SPAN[0]
+
+
+def test_the_arrow_keys_pan_the_view():
+    """The arrows move the view by a part of its span, and stop at the pole."""
+    state = _State(Config())
+    map_ = make_map(ANCHOR, 2)
+    before = map_.viewport()
+    assert _handle_key(curses.KEY_RIGHT, state, map_) is True
+    after = map_.viewport()
+    assert after.center_lon == pytest.approx(
+        before.center_lon + before.lon_span * PAN_FRACTION
+    )
+    assert after.center_lat == pytest.approx(before.center_lat)
+    _handle_key(curses.KEY_LEFT, state, map_)
+    assert map_.viewport().center_lon == pytest.approx(before.center_lon)
+    _handle_key(curses.KEY_DOWN, state, map_)
+    assert map_.viewport().center_lat == pytest.approx(
+        before.center_lat - before.lat_span * PAN_FRACTION
+    )
+    for _ in range(10):
+        _handle_key(curses.KEY_UP, state, map_)
+    # The view cannot show more than the pole.
+    assert map_.viewport().center_lat == pytest.approx(90.0 - before.lat_span / 2.0)
+
+
+def test_the_arrows_do_not_move_the_whole_world():
+    """The world is already all there: an arrow must not rotate it."""
+    state = _State(Config())
+    map_ = make_map(ANCHOR, 1)
+    assert _handle_key(curses.KEY_RIGHT, state, map_) is True
+    assert map_.center is None
+
+
+def test_the_status_bar_shows_where_a_zoomed_view_is():
+    """A zoomed map says the coordinates of its centre."""
+    map_ = make_map(ANCHOR, 2)
+    state = _State(Config())
+    state.anchor_text = "anchor 198.51.100.42 · NL"
+    text = "".join(part for part, _ in _status_lines(map_, state, state.stats)[2])
+    assert "zoom x3" in text
+    assert "at 52.4N 4.9E" in text
+    map_.reset_zoom()
+    text = "".join(part for part, _ in _status_lines(map_, state, state.stats)[2])
+    assert "at " not in text
+
+
+def test_an_off_screen_peer_points_to_the_edge_of_the_map():
+    """The far side of the world is an arrow, not an empty map."""
+    map_ = make_map(ANCHOR, 2)
+    cell = _edge_cell(FAR_PEER.lat, FAR_PEER.lon, map_.viewport(), map_)
+    assert cell is not None
+    line, column, arrow = cell
+    assert 0 <= line < map_.map_height
+    assert 0 <= column < map_.cols
+    assert arrow in ("←", "↖", "↙")
+    assert _edge_cell(LOCAL_PEER.lat, LOCAL_PEER.lon, map_.viewport(), map_) is None
+
+
+def test_the_edge_markers_show_a_peer_outside_the_view():
+    """The peer of a zoomed map is an arrow at the edge it went over."""
+    state = _State(Config())
+    state.anchor = ANCHOR
+    flow = make_flow("8.8.8.8|443|tcp", "firefox", FAR_PEER)
+    state.animator.handle_event(Opened(flow=flow), now=0.0)
+    map_ = make_map(ANCHOR, 2)
+    markers = _edge_markers(state, map_.viewport(), map_)
+    assert len(markers) == 1
+    line, column, arrow, _ = markers[0]
+    assert 0 <= line < map_.map_height
+    assert 0 <= column < map_.cols
+    assert arrow in ("←", "↖", "↙")
+
+
+def test_the_anchor_is_labelled_on_a_zoomed_map():
+    """The dot of the anchor has a name beside it when the map is close."""
+    state = _State(Config())
+    state.anchor = ANCHOR
+    map_ = make_map(ANCHOR, 2)
+    overlays = _anchor_overlays(state, map_.viewport(), map_)
+    assert any("Amsterdam" in text for _, _, text, _ in overlays)
+    map_.reset_zoom()
+    assert _anchor_overlays(state, map_.viewport(), map_) == []
+
+
+def test_a_missing_border_file_leaves_the_map_without_borders(tmp_path):
+    """The borders are an optional asset, not a reason to stop."""
+    cfg = Config(land_geojson=tmp_path / "land.geojson")
+    map_ = _Map(cfg, SNAPSHOT_COLS, SNAPSHOT_ROWS)
+    map_.zoom = ZOOM_PRESETS[2]
+    assert map_.borders() == {}
+
+
+def test_the_zoom_of_the_edge_markers_does_not_draw_the_world():
+    """The whole world has no edge: every point is already on the map."""
+    state = _State(Config())
+    map_ = make_map(ANCHOR, 1)
+    assert _edge_markers(state, map_.viewport(), map_) == []
 
 
 def test_a_failing_collector_does_not_kill_the_thread():
@@ -994,10 +1108,10 @@ def test_the_zoom_keys_step_and_reset_the_map():
 
 
 def test_the_wheel_zooms_around_the_pointer():
-    """The dot under the pointer stays under the pointer, wheel or not."""
+    """The point under the middle of the cell stays under the wheel."""
     map_ = make_map(ANCHOR, 1)
     column, line = 40, 20
-    dots = (column * 2, line * 4)
+    dots = (column * 2 + 1, line * 4 + 2)
     before = unproject(dots[0], dots[1], map_.viewport())
     _zoom_with_mouse(map_, (0, column, line, 0, curses.BUTTON4_PRESSED))
     assert map_.zoom == pytest.approx(ZOOM_STEP)

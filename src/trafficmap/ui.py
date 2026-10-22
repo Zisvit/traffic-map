@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import curses
 import logging
+import math
 import operator
 import os
 import queue
@@ -95,7 +96,17 @@ from trafficmap.flows import (
 )
 from trafficmap.geo import Geo, GeoResolver
 from trafficmap.projection import Viewport, project, unproject
-from trafficmap.worldmap import load_geojson, load_land, rasterize
+from trafficmap.worldmap import (
+    BORDER_CROSS,
+    BORDER_DOWN,
+    BORDER_HORIZONTAL,
+    BORDER_UP,
+    BORDER_VERTICAL,
+    border_cells,
+    load_geojson,
+    load_land,
+    rasterize,
+)
 
 __all__ = ["make_collector", "run", "snapshot"]
 
@@ -137,6 +148,17 @@ MAX_ZOOM = 120.0
 #: The factor one step of the zoom keys and of the wheel changes.
 ZOOM_STEP = 1.25
 
+#: The part of the view an arrow key moves, as a fraction of its span.
+PAN_FRACTION = 0.25
+
+#: The zoom at which the borders of the countries are drawn over the
+#: land.  The whole world is already legible without them, and at the
+#: first steps the borders would only thicken the coastlines.
+BORDER_MIN_ZOOM = 2.0
+
+#: The name of the country borders next to the land polygons.
+BORDERS_NAME = "borders.geojson"
+
 #: Number of lines of the panel of the busiest flows.
 TOP_PANEL_ROWS = 8
 
@@ -164,6 +186,7 @@ HELP_LINES = (
     " q  quit            space  pause the map",
     " t  busiest flows   l  country labels",
     " 1 2 3  zoom        + -  finer zoom",
+    " ← → ↑ ↓  pan       c  centre on me",
     " f  filter a process 0  whole world",
     " ?  this help       esc  clears the filter",
 )
@@ -201,6 +224,7 @@ _PALETTE: tuple[_Colour, ...] = (
     _Colour(curses.COLOR_WHITE, curses.COLOR_BLUE, 0),  # 11: a panel
     _Colour(curses.COLOR_WHITE, -1, curses.A_DIM),  # 12: a country label
     _Colour(curses.COLOR_MAGENTA, -1, curses.A_BOLD),  # 13: a pulse
+    _Colour(curses.COLOR_WHITE, -1, curses.A_DIM),  # 14: a country border
 )
 
 _C_DEFAULT = 0
@@ -213,6 +237,7 @@ _C_WARNING = 10
 _C_PANEL = 11
 _C_LABEL = 12
 _C_PULSE = 13
+_C_BORDER = 14
 
 #: The colour of every style of the canvas, for the comets that leave.
 _OUT_BY_STYLE: dict[int, int] = {
@@ -257,6 +282,28 @@ _ASCII_GLYPHS: dict[int, str] = {
 
 #: The glyph of a cell whose style is not known.
 _ASCII_UNKNOWN = " "
+
+#: The glyph of every direction of a country border, in Braille mode.
+#: A single dot is less disruptive than a box-drawing character: the
+#: land around it is still one Braille block, and the border reads as a
+#: dotted line of the map rather than a second drawing.
+_BORDER_GLYPHS: dict[int, str] = {
+    BORDER_HORIZONTAL: "·",
+    BORDER_VERTICAL: "·",
+    BORDER_DOWN: "·",
+    BORDER_UP: "·",
+    BORDER_CROSS: "·",
+}
+
+#: The same glyphs in ASCII mode, for a font without Braille.  A dot
+#: is as quiet as the Braille middle dot and needs no box drawing.
+_BORDER_ASCII: dict[int, str] = {
+    BORDER_HORIZONTAL: ".",
+    BORDER_VERTICAL: ".",
+    BORDER_DOWN: ".",
+    BORDER_UP: ".",
+    BORDER_CROSS: ".",
+}
 
 #: The canvas the incoming comets are drawn on a second time, to know
 #: which cells they touch.  It is kept between the frames and cleared
@@ -476,6 +523,9 @@ class _Map:
         self._geojson: dict | None = None
         self._visible: bytearray | None = None
         self._visible_key: tuple[float, ...] | None = None
+        self._borders: dict[tuple[int, int], int] | None = None
+        self._borders_key: tuple[float, ...] | None = None
+        self._borders_geojson: dict | None = None
 
     def resize(self, cols: int, rows: int) -> None:
         """Take the size of a new screen.
@@ -488,8 +538,14 @@ class _Map:
         self.rows = rows
         self.map_height = max(1, rows - STATUS_ROWS)
         self.canvas = Canvas(cols * 2, self.map_height * 4)
+        self._invalidate()
+
+    def _invalidate(self) -> None:
+        """Forget the masks that were built for the old view."""
         self._visible = None
         self._visible_key = None
+        self._borders = None
+        self._borders_key = None
 
     def spans(self) -> tuple[float, float]:
         """Return the spans of the view at the current zoom.
@@ -525,7 +581,7 @@ class _Map:
                 center_lat = anchor.lat
                 center_lon = anchor.lon
         if center_lon < -180.0 or center_lon >= 180.0:
-            center_lon = (center_lon + 180.0) % 360.0 - 180.0
+            center_lon = _normalize_lon(center_lon)
         return Viewport(
             width=self.canvas.width,
             height=self.canvas.height,
@@ -536,7 +592,12 @@ class _Map:
         )
 
     def set_zoom(self, zoom: float) -> None:
-        """Set the zoom factor and centre the view on the anchor again.
+        """Set the zoom factor, keeping the view where it is.
+
+        A preset is a step of the zoom, not a jump home: the view stays
+        on the place the wheel or the arrows left it on.  The key ``c``
+        takes it back to the anchor, and the whole world follows the
+        anchor again.
 
         Args:
             zoom: The zoom factor: the span of the world is divided by
@@ -544,13 +605,40 @@ class _Map:
                 them.
         """
         self.zoom = min(MAX_ZOOM, max(MIN_ZOOM, zoom))
-        self.center = None
-        self._visible = None
-        self._visible_key = None
+        if self.zoom <= MIN_ZOOM:
+            # The whole world is on the screen: there is no place to
+            # keep, and following the anchor is the honest state.
+            self.center = None
+        self._invalidate()
 
     def reset_zoom(self) -> None:
         """Show the whole world again, centred on the anchor."""
         self.set_zoom(MIN_ZOOM)
+
+    def recenter(self) -> None:
+        """Take the view back to the anchor, at the current zoom."""
+        self.center = None
+        self._invalidate()
+
+    def pan(self, east: float, north: float) -> None:
+        """Move the view by a fraction of its span.
+
+        Args:
+            east: How far to move the centre eastward, in spans of the
+                view.  A negative number moves it west.
+            north: How far to move the centre northward, in spans of
+                the view.  A negative number moves it south.
+        """
+        if self.zoom <= MIN_ZOOM:
+            # The whole world is on the screen already: there is no
+            # place to move it to.
+            return
+        viewport = self.viewport()
+        lon_span, lat_span = self.spans()
+        center_lon = _normalize_lon(viewport.center_lon + east * lon_span)
+        center_lat = _clamp_lat(viewport.center_lat + north * lat_span, lat_span)
+        self.center = (center_lat, center_lon)
+        self._invalidate()
 
     def zoom_by(self, factor: float, cursor: tuple[int, int] | None = None) -> None:
         """Zoom in or out, keeping the point under the cursor in place.
@@ -581,14 +669,19 @@ class _Map:
         lat, lon = unproject(x, y, old)
         self.zoom = new_zoom
         lon_span, lat_span = self.spans()
-        # The point of the world stays under the cursor: its place on
-        # the screen is the one of the old view, and the centre moves
-        # by what the new span puts between the cursor and the middle.
-        center_lon = lon - (x / (old.width - 1) - 0.5) * lon_span
-        center_lat = lat - (0.5 - y / (old.height - 1)) * lat_span
-        self.center = (center_lat, center_lon)
-        self._visible = None
-        self._visible_key = None
+        if new_zoom <= MIN_ZOOM:
+            # The whole world is visible: the place of the cursor has
+            # no meaning any more, and the anchor is the centre again.
+            self.center = None
+        else:
+            # The point of the world stays under the cursor: its place
+            # on the screen is the one of the old view, and the centre
+            # moves by what the new span puts between the cursor and
+            # the middle.
+            center_lon = _normalize_lon(lon - (x / (old.width - 1) - 0.5) * lon_span)
+            center_lat = lat - (0.5 - y / (old.height - 1)) * lat_span
+            self.center = (center_lat, center_lon)
+        self._invalidate()
 
     def land_mask(self) -> bytearray:
         """Return the land of the visible part of the world.
@@ -629,6 +722,47 @@ class _Map:
         self._visible_key = key
         return visible
 
+    def borders(self) -> dict[tuple[int, int], int]:
+        """Return the country borders of the visible part of the world.
+
+        The borders are drawn only when the map is zoomed in: on the
+        whole world they would thicken the coastlines without adding a
+        country that the land does not already show.  The file is the
+        ``borders.geojson`` next to the land polygons; a map without it
+        simply has no borders.
+
+        Returns:
+            The direction code of every character cell a border touches,
+            by ``(line, column)``.
+        """
+        if self.zoom < BORDER_MIN_ZOOM:
+            return {}
+        viewport = self.viewport()
+        key = (
+            float(self.canvas.width),
+            float(self.canvas.height),
+            round(viewport.lon_span, 9),
+            round(viewport.lat_span, 9),
+            round(viewport.center_lat, 6),
+            round(viewport.center_lon, 6),
+        )
+        if self._borders is not None and self._borders_key == key:
+            return self._borders
+        path = self._cfg.land_geojson.with_name(BORDERS_NAME)
+        if not path.exists():
+            self._borders = {}
+            self._borders_key = key
+            return self._borders
+        try:
+            if self._borders_geojson is None:
+                self._borders_geojson = load_geojson(path)
+            self._borders = border_cells(self._borders_geojson, viewport)
+        except (OSError, ValueError) as exc:
+            log.debug("cannot read the country borders %s: %s", path, exc)
+            self._borders = {}
+        self._borders_key = key
+        return self._borders
+
     def _zoom_mask(self, viewport: Viewport) -> bytearray:
         """Return the land of a zoomed view, drawn from the polygons.
 
@@ -652,6 +786,18 @@ class _Map:
             )
             self._world_size = size
         return self._world
+
+
+def _normalize_lon(lon: float) -> float:
+    """Wrap a longitude into the range ``[-180, 180)``.
+
+    Args:
+        lon: The longitude in degrees.
+
+    Returns:
+        The same meridian, in the range the projection expects.
+    """
+    return (lon + 180.0) % 360.0 - 180.0
 
 
 def _clamp_lat(center_lat: float, lat_span: float) -> float:
@@ -835,6 +981,21 @@ def _format_zoom(zoom: float) -> str:
     if abs(zoom - rounded) < 0.05:
         return f"x{rounded}"
     return f"x{zoom:.1f}"
+
+
+def _format_coords(lat: float, lon: float) -> str:
+    """Format a place for the status bar.
+
+    Args:
+        lat: The latitude, in degrees.
+        lon: The longitude, in degrees.
+
+    Returns:
+        The place as ``"55.8N 37.6E"``.
+    """
+    north = "N" if lat >= 0 else "S"
+    east = "E" if lon >= 0 else "W"
+    return f"{abs(lat):.1f}{north} {abs(lon):.1f}{east}"
 
 
 def _format_packets(value: float) -> str:
@@ -1240,6 +1401,9 @@ def _render(map_: _Map, state: _State, now: float, stats: Stats) -> _Frame:
         rows.append(segments)
 
     overlays: list[tuple[int, int, str, int]] = []
+    overlays.extend(_border_overlays(map_, style_rows, state.cfg.ascii))
+    overlays.extend(_anchor_overlays(state, viewport, map_))
+    overlays.extend(_edge_markers(state, viewport, map_))
     if state.show_labels:
         overlays.extend(_country_labels(state, viewport, map_))
     if state.show_top:
@@ -1254,6 +1418,141 @@ def _render(map_: _Map, state: _State, now: float, stats: Stats) -> _Frame:
         overlays=overlays,
         status=_status_lines(map_, state, stats),
     )
+
+
+def _border_overlays(
+    map_: _Map, style_rows: list[list[int]], ascii_mode: bool
+) -> list[tuple[int, int, str, int]]:
+    """Return the country borders as character cells.
+
+    A border cell that holds a peer, a comet or the anchor is left to
+    the element that is already there: the data is more important than
+    the line of the border.
+
+    Args:
+        map_: The map whose borders are drawn.
+        style_rows: The style of every cell of the map.
+        ascii_mode: Whether the map is drawn with ASCII characters.
+
+    Returns:
+        The border cells, each a ``(line, column, text, colour)``.
+    """
+    glyphs = _BORDER_ASCII if ascii_mode else _BORDER_GLYPHS
+    overlays: list[tuple[int, int, str, int]] = []
+    for (line, column), code in sorted(map_.borders().items()):
+        if not (0 <= line < len(style_rows) and 0 <= column < len(style_rows[line])):
+            continue
+        if style_rows[line][column] > STYLE_LAND:
+            continue
+        overlays.append((line, column, glyphs.get(code, "·"), _C_BORDER))
+    return overlays
+
+
+def _anchor_overlays(
+    state: _State, viewport: Viewport, map_: _Map
+) -> list[tuple[int, int, str, int]]:
+    """Return the name of the anchor next to its dot, when zoomed in.
+
+    Args:
+        state: What the interface knows.
+        viewport: The part of the world the canvas shows.
+        map_: The map.
+
+    Returns:
+        The label of the anchor, or an empty list when the map is not
+        zoomed in or the anchor is not known.
+    """
+    anchor = state.anchor
+    if map_.zoom < BORDER_MIN_ZOOM or anchor is None:
+        return []
+    if anchor.lat is None or anchor.lon is None:
+        return []
+    point = project(anchor.lat, anchor.lon, viewport)
+    if point is None:
+        return []
+    line = point[1] // 4
+    column = point[0] // 2
+    name = (anchor.city or "you").strip()
+    text = f" {name}"[: max(0, map_.cols - column - 1)]
+    if line >= map_.map_height or not text.strip():
+        return []
+    return [(line, column + 1, text, _C_ANCHOR)]
+
+
+#: The arrows of the edge markers, by octant of the screen: east first,
+#: then clockwise.
+_EDGE_ARROWS = ("→", "↘", "↓", "↙", "←", "↖", "↑", "↗")
+
+
+def _edge_markers(
+    state: _State, viewport: Viewport, map_: _Map
+) -> list[tuple[int, int, str, int]]:
+    """Return arrows to the peers and the anchor that are off the map.
+
+    A zoomed view leaves most of the traffic outside the map.  An arrow
+    on the edge says in which direction the peer is, so that the map
+    does not look empty when the flows are just over the horizon.
+
+    Args:
+        state: What the interface knows.
+        viewport: The part of the world the canvas shows.
+        map_: The map.
+
+    Returns:
+        The edge arrows, each a ``(line, column, text, colour)``.
+    """
+    if map_.zoom <= MIN_ZOOM:
+        return []
+    markers: dict[tuple[int, int], tuple[str, int]] = {}
+    places: list[tuple[float, float, int]] = []
+    for peer in state.animator.visible_peers:
+        geo = peer.geo
+        if geo.lat is not None and geo.lon is not None:
+            places.append((geo.lat, geo.lon, _C_PEER))
+    anchor = state.anchor
+    if anchor is not None and anchor.lat is not None and anchor.lon is not None:
+        places.append((anchor.lat, anchor.lon, _C_ANCHOR))
+    for lat, lon, colour in places:
+        cell = _edge_cell(lat, lon, viewport, map_)
+        if cell is None:
+            continue
+        line, column, arrow = cell
+        markers.setdefault((line, column), (arrow, colour))
+    return [
+        (line, column, arrow, colour)
+        for (line, column), (arrow, colour) in markers.items()
+    ]
+
+
+def _edge_cell(
+    lat: float, lon: float, viewport: Viewport, map_: _Map
+) -> tuple[int, int, str] | None:
+    """Return the edge cell and the arrow of a point outside the view.
+
+    Args:
+        lat: The latitude of the point.
+        lon: The longitude of the point.
+        viewport: The part of the world the canvas shows.
+        map_: The map.
+
+    Returns:
+        ``(line, column, arrow)``, or ``None`` when the point is on the
+        map (or the map is too small for a marker).
+    """
+    dlon = _normalize_lon(lon - viewport.center_lon) / viewport.lon_span
+    dlat = (viewport.center_lat - lat) / viewport.lat_span
+    if abs(dlon) <= 0.5 and abs(dlat) <= 0.5:
+        return None
+    tx = 0.5 / abs(dlon) if dlon else float("inf")
+    ty = 0.5 / abs(dlat) if dlat else float("inf")
+    step = min(tx, ty)
+    x = 0.5 + dlon * step
+    y = 0.5 + dlat * step
+    column = min(max(int(x * map_.cols), 0), map_.cols - 1)
+    line = min(max(int(y * map_.map_height), 0), map_.map_height - 1)
+    angle = math.atan2(dlat, dlon)
+    octant = int((angle + math.pi / 8.0) / (math.pi / 4.0)) % 8
+    return (line, column, _EDGE_ARROWS[octant])
 
 
 def _country_labels(
@@ -1399,7 +1698,14 @@ def _status_lines(
         parts.append(("no root: only your sockets", _C_WARNING))
     parts.append((state.anchor_text, _C_DEFAULT))
     if map_.zoom > MIN_ZOOM:
+        viewport = map_.viewport()
         parts.append((f"zoom {_format_zoom(map_.zoom)}", _C_DEFAULT))
+        parts.append(
+            (
+                f"at {_format_coords(viewport.center_lat, viewport.center_lon)}",
+                _C_DEFAULT,
+            )
+        )
     if state.filter_input is not None:
         parts.append((f"filter: {state.filter_input}", _C_DEFAULT))
     elif state.filter:
@@ -1698,9 +2004,18 @@ def _paint(stdscr: "curses.window", frame: _Frame) -> None:
     for line, column, text, colour in frame.overlays:
         _addstr(stdscr, line, column, text, colour)
     for index, segments in enumerate(frame.status):
+        line = frame.map_height + index
+        try:
+            # A status line gets shorter when the view goes back to the
+            # whole world: without this the tail of the old line stays
+            # on the screen.
+            stdscr.move(line, 0)
+            stdscr.clrtoeol()
+        except curses.error:
+            pass
         column = 0
         for text, colour in segments:
-            _addstr(stdscr, frame.map_height + index, column, text, colour)
+            _addstr(stdscr, line, column, text, colour)
             column += len(text)
     stdscr.refresh()
 
@@ -1751,6 +2066,16 @@ def _handle_key(key: int, state: _State, map_: _Map) -> bool:
         state.show_labels = not state.show_labels
     elif key == ord("?"):
         state.show_help = not state.show_help
+    elif key == curses.KEY_LEFT:
+        map_.pan(-PAN_FRACTION, 0.0)
+    elif key == curses.KEY_RIGHT:
+        map_.pan(PAN_FRACTION, 0.0)
+    elif key == curses.KEY_UP:
+        map_.pan(0.0, PAN_FRACTION)
+    elif key == curses.KEY_DOWN:
+        map_.pan(0.0, -PAN_FRACTION)
+    elif key == ord("c"):
+        map_.recenter()
     elif key in (ord("1"), ord("2"), ord("3")):
         map_.set_zoom(ZOOM_PRESETS[key - ord("0")])
     elif key in (ord("+"), ord("=")):
@@ -1833,8 +2158,8 @@ def _zoom_with_mouse(map_: _Map, event: tuple[int, int, int, int, int]) -> None:
         cursor = None
     else:
         # A character cell of the map holds two dots in width and four
-        # in height.
-        cursor = (mouse_x * 2, mouse_y * 4)
+        # in height; the wheel is over the middle of the cell.
+        cursor = (mouse_x * 2 + 1, mouse_y * 4 + 2)
     if buttons & curses.BUTTON4_PRESSED:
         map_.zoom_by(ZOOM_STEP, cursor)
     elif buttons & curses.BUTTON5_PRESSED:

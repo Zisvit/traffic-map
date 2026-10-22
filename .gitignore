@@ -6,4 +6,5 @@ dist/
 *.whl
 assets/*.mmdb
 assets/land.geojson
+assets/borders.geojson
 .pytest_cache/

@@ -31,6 +31,7 @@ grow without bound.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import tempfile
@@ -40,10 +41,27 @@ from PIL import Image, ImageDraw
 
 from trafficmap.projection import Viewport
 
-__all__ = ["rasterize", "load_land", "load_geojson"]
+__all__ = ["rasterize", "load_land", "load_geojson", "border_cells"]
 
 #: Translation table that turns the gray pixels of the image into bits.
 _TO_BIT = bytes(1 if value else 0 for value in range(256))
+
+#: Direction of a border inside a character cell: a horizontal line.
+BORDER_HORIZONTAL = 0
+
+#: Direction of a border inside a character cell: a vertical line.
+BORDER_VERTICAL = 1
+
+#: Direction of a border inside a character cell: a line that goes down
+#: to the right.
+BORDER_DOWN = 2
+
+#: Direction of a border inside a character cell: a line that goes up
+#: to the right.
+BORDER_UP = 3
+
+#: Two borders of different directions cross in one cell.
+BORDER_CROSS = 4
 
 
 def load_geojson(path: Path) -> dict:
@@ -144,6 +162,222 @@ def _shifts_of(viewport: Viewport | None) -> tuple[float, ...]:
     if abs(center) + viewport.lon_span / 2 <= 180.0:
         return (0.0,)
     return (-360.0, 0.0, 360.0)
+
+
+def border_cells(geojson: dict, viewport: Viewport) -> dict[tuple[int, int], int]:
+    """Rasterize the country borders onto the character cells of a view.
+
+    The borders are drawn as one-cell lines on the same grid as the
+    Braille canvas: every character cell holds one direction code, which
+    the interface turns into a glyph.  A line that leaves the view is
+    clipped, so a border that crosses the edge does not paint a frame
+    around the map.
+
+    Args:
+        geojson: GeoJSON document with ``LineString`` or
+            ``MultiLineString`` features.
+        viewport: The part of the world the map shows.
+
+    Returns:
+        The direction code of every cell the borders touch, by
+        ``(line, column)``.  The result is empty for a viewport that is
+        too small to hold a character cell or that has no positive span.
+
+    Raises:
+        ValueError: If the document is not a GeoJSON object.
+    """
+    if not isinstance(geojson, dict):
+        raise ValueError(f"expected a GeoJSON object, got {type(geojson).__name__}")
+    if viewport.width < 2 or viewport.height < 4:
+        return {}
+    if viewport.lon_span <= 0.0 or viewport.lat_span <= 0.0:
+        return {}
+    cells: dict[tuple[int, int], int] = {}
+    owners: dict[tuple[int, int], int] = {}
+    for line_id, line in enumerate(_lines(geojson)):
+        previous_lon: float | None = None
+        previous: tuple[float, float] | None = None
+        for lon, lat in line:
+            if not (math.isfinite(lon) and math.isfinite(lat)):
+                previous = None
+                previous_lon = None
+                continue
+            if previous_lon is not None and abs(lon - previous_lon) > 180.0:
+                # Natural Earth splits its lines at the antimeridian;
+                # a segment that jumps a whole turn is not a border of
+                # this view, and drawing it would paint a line across
+                # the whole map.
+                previous = None
+                previous_lon = None
+                continue
+            point = _to_cell(lat, lon, viewport)
+            if previous is not None:
+                clipped = _clip_segment(
+                    previous[0],
+                    previous[1],
+                    point[0],
+                    point[1],
+                    0.0,
+                    0.0,
+                    float(max(0, viewport.width // 2 - 1)),
+                    float(max(0, viewport.height // 4 - 1)),
+                )
+                if clipped is not None:
+                    _draw_border(cells, owners, clipped, line_id)
+            previous = point
+            previous_lon = lon
+    return cells
+
+
+def _lines(geojson: dict) -> list[list[tuple[float, float]]]:
+    """Return the polylines of a GeoJSON document.
+
+    Args:
+        geojson: A ``FeatureCollection``, a ``Feature``, a
+            ``LineString`` or a ``MultiLineString``.
+
+    Returns:
+        One list of ``(lon, lat)`` pairs per line; empty for geometry
+        types that are not lines.
+    """
+    features = geojson.get("features")
+    if isinstance(features, list):
+        documents = [feature for feature in features if isinstance(feature, dict)]
+    else:
+        documents = [geojson]
+    lines: list[list[tuple[float, float]]] = []
+    for document in documents:
+        geometry = document.get("geometry", document)
+        if not isinstance(geometry, dict):
+            continue
+        kind = geometry.get("type")
+        coordinates = geometry.get("coordinates")
+        if not isinstance(coordinates, list):
+            continue
+        if kind == "LineString":
+            candidates = [coordinates]
+        elif kind == "MultiLineString":
+            candidates = [line for line in coordinates if isinstance(line, list)]
+        else:
+            continue
+        for candidate in candidates:
+            line = [
+                (float(point[0]), float(point[1]))
+                for point in candidate
+                if isinstance(point, list) and len(point) >= 2
+            ]
+            if len(line) >= 2:
+                lines.append(line)
+    return lines
+
+
+def _to_cell(lat: float, lon: float, viewport: Viewport) -> tuple[float, float]:
+    """Map a geographic point onto the character-cell grid.
+
+    The dot grid gives two dots per character in width and four in
+    height, so the result is a fractional cell coordinate: the caller
+    rounds it when it draws the line.
+    """
+    dlon = (lon - viewport.center_lon + 180.0) % 360.0 - 180.0
+    x = (dlon / viewport.lon_span + 0.5) * (viewport.width - 1) / 2.0
+    y = (
+        (0.5 - (lat - viewport.center_lat) / viewport.lat_span)
+        * (viewport.height - 1)
+        / 4.0
+    )
+    return (x, y)
+
+
+def _clip_segment(
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    xmin: float,
+    ymin: float,
+    xmax: float,
+    ymax: float,
+) -> tuple[float, float, float, float] | None:
+    """Clip a segment to a rectangle with the Liang-Barsky algorithm.
+
+    Returns:
+        The clipped endpoints, or ``None`` when the segment does not
+        touch the rectangle.
+    """
+    dx = x1 - x0
+    dy = y1 - y0
+    low = 0.0
+    high = 1.0
+    for p, q in (
+        (-dx, x0 - xmin),
+        (dx, xmax - x0),
+        (-dy, y0 - ymin),
+        (dy, ymax - y0),
+    ):
+        if p == 0.0:
+            if q < 0.0:
+                return None
+            continue
+        ratio = q / p
+        if p < 0.0:
+            low = max(low, ratio)
+        else:
+            high = min(high, ratio)
+        if low > high:
+            return None
+    return (
+        x0 + low * dx,
+        y0 + low * dy,
+        x0 + high * dx,
+        y0 + high * dy,
+    )
+
+
+def _draw_border(
+    cells: dict[tuple[int, int], int],
+    owners: dict[tuple[int, int], int],
+    segment: tuple[float, float, float, float],
+    line_id: int,
+) -> None:
+    """Draw one clipped segment into the cell map, with Bresenham.
+
+    A cell that the same border touches twice keeps one direction: the
+    rounding of a short segment must not turn the line into a field of
+    crosses.  A cell that two different borders touch is a real cross.
+    """
+    x0 = int(round(segment[0]))
+    y0 = int(round(segment[1]))
+    x1 = int(round(segment[2]))
+    y1 = int(round(segment[3]))
+    dx = abs(x1 - x0)
+    sx = 1 if x0 < x1 else -1
+    dy = -abs(y1 - y0)
+    sy = 1 if y0 < y1 else -1
+    error = dx + dy
+    if x0 == x1:
+        direction = BORDER_VERTICAL
+    elif y0 == y1:
+        direction = BORDER_HORIZONTAL
+    elif (x1 - x0) * (y1 - y0) > 0:
+        direction = BORDER_DOWN
+    else:
+        direction = BORDER_UP
+    while True:
+        key = (y0, x0)
+        if key not in cells:
+            cells[key] = direction
+            owners[key] = line_id
+        elif owners[key] != line_id:
+            cells[key] = BORDER_CROSS
+        if x0 == x1 and y0 == y1:
+            break
+        doubled = 2 * error
+        if doubled >= dy:
+            error += dy
+            x0 += sx
+        if doubled <= dx:
+            error += dx
+            y0 += sy
 
 
 def load_land(

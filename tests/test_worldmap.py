@@ -6,7 +6,15 @@ from pathlib import Path
 import pytest
 
 from trafficmap.projection import Viewport
-from trafficmap.worldmap import load_geojson, load_land, rasterize
+from trafficmap.worldmap import (
+    BORDER_CROSS,
+    BORDER_HORIZONTAL,
+    BORDER_VERTICAL,
+    border_cells,
+    load_geojson,
+    load_land,
+    rasterize,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SAMPLE = FIXTURES / "land_sample.geojson"
@@ -368,3 +376,90 @@ def test_a_viewport_needs_a_positive_span():
             HEIGHT,
             Viewport(width=WIDTH, height=HEIGHT, lon_span=0.0, lat_span=10.0),
         )
+
+
+# -- the country borders -------------------------------------------------
+
+
+def _border(*lines: list[list[float]]) -> dict:
+    """Return a GeoJSON LineString or MultiLineString of the lines."""
+    if len(lines) == 1:
+        geometry = {"type": "LineString", "coordinates": lines[0]}
+    else:
+        geometry = {"type": "MultiLineString", "coordinates": list(lines)}
+    return {"type": "Feature", "geometry": geometry, "properties": {}}
+
+
+def _border_view() -> Viewport:
+    """Return a small view of the world around the origin."""
+    return Viewport(
+        width=20,
+        height=12,
+        center_lat=0.0,
+        center_lon=0.0,
+        lon_span=40.0,
+        lat_span=20.0,
+    )
+
+
+def test_a_horizontal_border_is_a_row_of_cells():
+    """A border from west to east is a horizontal line on the cells."""
+    cells = border_cells(
+        _border([[5.0, 0.0], [-5.0, 0.0]]),
+        _border_view(),
+    )
+    assert set(cells) == {(1, 4), (1, 5), (1, 6)}
+    assert set(cells.values()) == {BORDER_HORIZONTAL}
+
+
+def test_a_vertical_border_is_a_column_of_cells():
+    """A border from south to north is a vertical line on the cells."""
+    cells = border_cells(
+        _border([[0.0, -5.0], [0.0, 5.0]]),
+        _border_view(),
+    )
+    assert set(cells) == {(1, 5), (2, 5)}
+    assert set(cells.values()) == {BORDER_VERTICAL}
+
+
+def test_a_border_is_clipped_to_the_view():
+    """A long border paints the edge of the map, not the space outside."""
+    viewport = _border_view()
+    cells = border_cells(_border([[-30.0, 0.0], [30.0, 0.0]]), viewport)
+    columns = {column for line, column in cells}
+    assert columns == set(range(viewport.width // 2))
+    assert all(line == 1 for line, _ in cells)
+
+
+def test_borders_of_both_directions_cross():
+    """Two borders that meet in one cell make a cross."""
+    cells = border_cells(
+        _border([[5.0, 0.0], [-5.0, 0.0]], [[0.0, -5.0], [0.0, 5.0]]),
+        _border_view(),
+    )
+    assert cells[(1, 5)] == BORDER_CROSS
+
+
+def test_a_border_outside_the_view_is_not_drawn():
+    """A border of another part of the world leaves the map empty."""
+    cells = border_cells(_border([[100.0, 0.0], [110.0, 0.0]]), _border_view())
+    assert cells == {}
+
+
+def test_a_border_that_jumps_the_antimeridian_is_skipped():
+    """A segment that goes a whole turn around the world is not a border."""
+    cells = border_cells(_border([[-179.0, 0.0], [179.0, 0.0]]), _border_view())
+    assert cells == {}
+
+
+def test_a_multi_line_border_is_drawn():
+    """Every line of a MultiLineString is on the map."""
+    cells = border_cells(
+        _border(
+            [[-5.0, -5.0], [-5.0, 5.0]],
+            [[5.0, -5.0], [5.0, 5.0]],
+        ),
+        _border_view(),
+    )
+    assert (1, 4) in cells or (2, 4) in cells
+    assert (1, 6) in cells or (2, 6) in cells

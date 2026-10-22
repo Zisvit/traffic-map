@@ -48,6 +48,12 @@ def test_month_labels_cross_the_year_boundary():
     ]
 
 
+def test_the_assets_include_the_map_and_its_borders():
+    """The zoom draws borders, so the fetcher has to bring them too."""
+    names = {asset.name for asset in fetch_assets.ASSETS}
+    assert {"land.geojson", "borders.geojson"} <= names
+
+
 def test_validate_geojson_accepts_a_feature_collection():
     fetch_assets.validate_geojson(b'{"type": "FeatureCollection", "features": []}')
 
