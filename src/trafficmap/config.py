@@ -31,6 +31,8 @@ def default_cache_dir() -> Path:
 class Config:
     fps: int = 12
     poll_ms: int = 1000
+    capture: str = "pcap"
+    iface: str = ""
     city_db: Path = ASSETS / "dbip-city-lite.mmdb"
     asn_db: Path | None = ASSETS / "dbip-asn-lite.mmdb"
     land_geojson: Path = ASSETS / "land.geojson"
@@ -51,6 +53,9 @@ _INT_MINIMUMS = {"fps": 1, "poll_ms": 1, "frames": 0}
 _BOOL_FIELDS = frozenset({"ascii", "no_anchor"})
 _PATH_FIELDS = frozenset({"city_db", "land_geojson", "cache_dir"})
 _OPTIONAL_PATH_FIELDS = frozenset({"asn_db", "mock", "snapshot", "dump"})
+
+#: The ways of reading the traffic of the machine.
+CAPTURE_MODES = frozenset({"pcap", "ss"})
 
 _TRUE_VALUES = frozenset({"1", "true", "yes"})
 _FALSE_VALUES = frozenset({"0", "false", "no"})
@@ -116,6 +121,18 @@ def _build_parser() -> argparse.ArgumentParser:
     add = parser.add_argument
     add("--fps", metavar="N", default=argparse.SUPPRESS, help="UI frames per second")
     add("--poll-ms", metavar="MS", default=argparse.SUPPRESS, help="collector interval")
+    add(
+        "--capture",
+        metavar="MODE",
+        default=argparse.SUPPRESS,
+        help="how to read the traffic: pcap (the packets, needs privileges) or ss (the sockets)",
+    )
+    add(
+        "--iface",
+        metavar="NAME",
+        default=argparse.SUPPRESS,
+        help="interface to capture on, empty means the one of the route to the internet",
+    )
     add("--city-db", metavar="PATH", default=argparse.SUPPRESS, help="city MMDB")
     add("--asn-db", metavar="PATH", default=argparse.SUPPRESS, help="ASN MMDB")
     add(
@@ -173,9 +190,32 @@ def _convert(name: str, value: object) -> object:
         return _as_path(name, value, optional=True)
     if name == "anchor":
         return _as_anchor(value)
-    if name == "filter_process":
+    if name == "capture":
+        return _as_capture(value)
+    if name in ("filter_process", "iface"):
         return _as_str(name, value)
     raise AssertionError(f"unhandled config field: {name}")
+
+
+def _as_capture(value: object) -> str:
+    """Return the way of reading the traffic of the machine.
+
+    Args:
+        value: The value of the setting.
+
+    Returns:
+        The name of the mode, ``"pcap"`` or ``"ss"``.
+
+    Raises:
+        ValueError: If the value is not one of the modes.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"capture must be a string, got {value!r}")
+    mode = value.strip().lower()
+    if mode not in CAPTURE_MODES:
+        modes = ", ".join(sorted(CAPTURE_MODES))
+        raise ValueError(f"capture must be one of {modes}, got {value!r}")
+    return mode
 
 
 def _as_int(name: str, value: object) -> int:

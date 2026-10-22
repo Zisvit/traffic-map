@@ -33,6 +33,7 @@ import time
 from typing import Any, Callable, TextIO
 
 from trafficmap.collector_mock import MockCollector
+from trafficmap.collector_pcap import PcapCollector
 from trafficmap.collector_ss import SocketRow, SsCollector
 from trafficmap.config import Config
 from trafficmap.flows import Closed, FlowEvent, FlowTable, Opened
@@ -58,7 +59,9 @@ def dump_events(events: list[FlowEvent], now: float, out: TextIO) -> None:
 
 
 def run_dump(
-    cfg: Config, resolver: GeoResolver, collector: SsCollector | MockCollector
+    cfg: Config,
+    resolver: GeoResolver,
+    collector: SsCollector | PcapCollector | MockCollector,
 ) -> int:
     """Poll the sockets and write the events until the program stops.
 
@@ -102,7 +105,9 @@ def run_dump(
             restore()
 
 
-def _poll(collector: SsCollector | MockCollector) -> list[SocketRow] | None:
+def _poll(
+    collector: SsCollector | PcapCollector | MockCollector,
+) -> list[SocketRow] | None:
     """Read the sockets once and survive a failure of the command.
 
     Args:

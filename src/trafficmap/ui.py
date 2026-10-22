@@ -80,6 +80,7 @@ from trafficmap.anim import (
 )
 from trafficmap.braille import Canvas
 from trafficmap.collector_mock import MockCollector
+from trafficmap.collector_pcap import Burst, PcapCollector
 from trafficmap.collector_ss import SocketRow, SsCollector
 from trafficmap.config import Config
 from trafficmap.flows import (
@@ -279,6 +280,27 @@ class _Frame:
         return "\n".join(lines) + "\n"
 
 
+@dataclass(frozen=True, slots=True)
+class _Sample:
+    """One poll of the collector, as the interface receives it.
+
+    Attributes:
+        events: The events of the poll: the flows that appeared, that
+            carried traffic or that went away.
+        flows: The flows that are on the map.
+        stats: The statistics of the whole machine.
+        now: The moment of the poll, in seconds.
+        bursts: The bursts of the packets, by peer.  They are empty
+            when the collector does not read the packets.
+    """
+
+    events: list[FlowEvent]
+    flows: list[Flow]
+    stats: Stats
+    now: float
+    bursts: list[Burst] = field(default_factory=list)
+
+
 class _State:
     """What the interface knows between two frames.
 
@@ -310,6 +332,10 @@ class _State:
         self.collector: _CollectorThread | None = None
         #: The message of the last failure of the collector.
         self.error: str | None = None
+        #: The words that tell the user what is broken.
+        self.error_label = "collector error"
+        #: The bursts of the packets of the last poll, by peer.
+        self.bursts: list[Burst] = []
         #: The clock of the animation.  It stands still while the map
         #: is paused, so that the map is frozen as a whole.
         self.now = 0.0
@@ -385,6 +411,9 @@ class _State:
         """
         collector = self.collector
         self.error = collector.error if collector is not None else None
+        self.error_label = (
+            collector.error_label if collector is not None else "collector error"
+        )
 
 
 class _Map:
@@ -692,7 +721,124 @@ def _clock_of(collector: object) -> Callable[[], float]:
     return time.monotonic
 
 
-def make_collector(cfg: Config) -> SsCollector | MockCollector:
+class _ProcessLookup:
+    """The processes of the machine, by the port of their socket.
+
+    The packets of a capture do not know the process that sent them:
+    the table of the sockets of the machine does.  The table is read
+    at most once a second, because ``ss`` is not cheap.
+
+    Args:
+        collector: The collector that reads the sockets.
+        interval: The smallest time between two reads of the table, in
+            seconds.
+    """
+
+    def __init__(
+        self, collector: SsCollector | None = None, interval: float = 1.0
+    ) -> None:
+        self._collector = collector if collector is not None else SsCollector()
+        self._interval = interval
+        self._ports: dict[int, tuple[int | None, str | None]] = {}
+        self._read_at: float | None = None
+
+    def __call__(self) -> dict[int, tuple[int | None, str | None]]:
+        """Return the processes of the machine, by port.
+
+        Returns:
+            The table of the processes, ``{port: (pid, name)}``.  The
+            last table is kept when the sockets cannot be read.
+        """
+        now = time.monotonic()
+        if self._read_at is not None and now - self._read_at < self._interval:
+            return self._ports
+        self._read_at = now
+        try:
+            rows = self._collector.poll()
+        except RuntimeError as exc:
+            log.debug("cannot read the sockets: %s", exc)
+            return self._ports
+        ports: dict[int, tuple[int | None, str | None]] = {}
+        for row in rows:
+            ports[row.local[1]] = (row.pid, row.process)
+        self._ports = ports
+        return ports
+
+
+class _FallbackCollector:
+    """The packets of the network when they can be read, the sockets otherwise.
+
+    The reading of the packets needs privileges that the user may not
+    have given to the program.  The map is worth showing anyway: the
+    sockets of the machine are read instead, and the status bar says
+    that the packets are not tracked, so that the user knows what the
+    map shows.
+
+    Args:
+        primary: The collector of the packets, or ``None`` when it
+            could not even be built.
+        fallback: The collector of the sockets.
+        warning: The message of the failure of the capture, when it is
+            already known.
+    """
+
+    #: The words that tell the user that the capture is broken.
+    error_label = "capture error"
+
+    def __init__(
+        self,
+        primary: object | None,
+        fallback: object,
+        warning: str | None = None,
+    ) -> None:
+        self._primary = primary
+        self._fallback = fallback
+        self._warning = warning
+        self._switched = primary is None
+
+    @property
+    def warning(self) -> str | None:
+        """The message that stays on the screen while the sockets are read."""
+        return self._warning
+
+    def poll(self) -> list[SocketRow]:
+        """Read the traffic of the machine.
+
+        Returns:
+            The sockets that carry a flow.  The packets are read when
+            they can be, the sockets when they cannot.
+        """
+        if not self._switched:
+            try:
+                return self._primary.poll()  # type: ignore[attr-defined]
+            except RuntimeError as exc:
+                # The capture is not allowed: the sockets are read
+                # instead, and the map keeps working.
+                self._switched = True
+                self._warning = f"{exc} (sockets only)"
+                log.info("cannot read the packets: %s", exc)
+        return self._fallback.poll()  # type: ignore[attr-defined]
+
+    def drain_bursts(self) -> list[Burst]:
+        """Return the bursts of the packets, when there are any.
+
+        Returns:
+            The bursts of the packets since the last poll.  The list is
+            empty when the packets are not read.
+        """
+        if self._switched:
+            return []
+        drain = getattr(self._primary, "drain_bursts", None)
+        if drain is None:
+            return []
+        try:
+            return list(drain())
+        except Exception as exc:  # noqa: BLE001 - the map must survive
+            log.debug("cannot read the bursts: %s", exc)
+            return []
+
+
+def make_collector(cfg: Config) -> SsCollector | PcapCollector | MockCollector:
     """Build the collector of the program.
 
     Args:
@@ -700,7 +846,10 @@ def make_collector(cfg: Config) -> SsCollector | MockCollector:
 
     Returns:
         The mock collector when the configuration names a recording,
-        the collector of ``ss`` otherwise.
+        the collector of the packets when the configuration asks for
+        the packets, the collector of ``ss`` otherwise.  A capture
+        that cannot start does not stop the program: the sockets are
+        read instead, and the status bar shows what is broken.
 
     Raises:
         FileNotFoundError: If the recording does not exist.
@@ -708,6 +857,17 @@ def make_collector(cfg: Config) -> SsCollector | MockCollector:
     """
     if cfg.mock is not None:
         return MockCollector(cfg.mock)
+    if cfg.capture == "pcap":
+        try:
+            capture: object | None = PcapCollector(
+                interface=cfg.iface, process_lookup=_ProcessLookup()
+            )
+            warning: str | None = None
+        except RuntimeError as exc:
+            log.info("cannot start the capture: %s", exc)
+            capture = None
+            warning = f"{exc} (sockets only)"
+        return _FallbackCollector(capture, SsCollector(), warning)
     return SsCollector()
 
 
@@ -1054,7 +1214,7 @@ def _status_lines(
     if state.error:
         # The collector is down: the banner comes first, it is the
         # most important thing the user has to know.
-        parts.append((f"collector error: {state.error}", _C_WARNING))
+        parts.append((f"{state.error_label}: {state.error}", _C_WARNING))
     if not _is_root():
         parts.append(("no root: only your sockets", _C_WARNING))
     parts.append((state.anchor_text, _C_DEFAULT))
@@ -1155,7 +1315,7 @@ class _CollectorThread(threading.Thread):
         self,
         collector: object,
         table: FlowTable,
-        out: "queue.Queue[tuple[list[FlowEvent], list[Flow], Stats, float]]",
+        out: "queue.Queue[_Sample]",
         poll_ms: int,
         stop: threading.Event,
         wait: Callable[[float], bool] | None = None,
@@ -1180,6 +1340,15 @@ class _CollectorThread(threading.Thread):
         with self._error_lock:
             return self._error
 
+    @property
+    def error_label(self) -> str:
+        """The words that tell the user what is broken.
+
+        They are ``"capture error"`` when the collector reads the
+        packets, and ``"collector error"`` otherwise.
+        """
+        return getattr(self._collector, "error_label", "collector error")
+
     def _set_error(self, message: str | None) -> None:
         """Remember the message of the last failure of the collector.
 
@@ -1199,6 +1368,7 @@ class _CollectorThread(threading.Thread):
             collector = self._collector
             try:
                 rows: list[SocketRow] = collector.poll()  # type: ignore[attr-defined]
+                bursts = _drain_bursts(collector)
             except Exception as exc:  # noqa: BLE001 - the map must survive
                 # The collector is down: the error is shown in the
                 # status bar and the poll is tried again, later and
@@ -1210,13 +1380,45 @@ class _CollectorThread(threading.Thread):
                 self._wait(retry)
                 retry = min(retry + RETRY_STEP, RETRY_MAX)
                 continue
-            self._set_error(None)
+            # A collector that works may still have something to say:
+            # the capture of the packets falls back to the sockets
+            # when it is not allowed, and the message stays on the
+            # screen.
+            self._set_error(getattr(collector, "warning", None))
             retry = RETRY_FIRST
             if previous is None or now != previous:
                 events = self._table.update(rows, now)
                 previous = now
-                self._out.put((events, self._table.flows(), self._table.stats(), now))
+                self._out.put(
+                    _Sample(
+                        events=events,
+                        flows=self._table.flows(),
+                        stats=self._table.stats(),
+                        now=now,
+                        bursts=bursts,
+                    )
+                )
             self._wait(self._interval)
+
+
+def _drain_bursts(collector: object) -> list[Burst]:
+    """Take the bursts of the packets of a collector, if it has any.
+
+    Args:
+        collector: The collector that reads the sockets.
+
+    Returns:
+        The bursts of the packets of the last poll.  The list is empty
+        for the collectors that do not read the packets.
+    """
+    drain = getattr(collector, "drain_bursts", None)
+    if drain is None:
+        return []
+    try:
+        return list(drain())
+    except Exception as exc:  # noqa: BLE001 - the map must survive
+        log.debug("cannot read the bursts: %s", exc)
+        return []
 
 
 def _error_text(exc: BaseException) -> str:
@@ -1440,9 +1642,7 @@ def _loop(
     state = _State(cfg)
     rows, cols = stdscr.getmaxyx()
     map_ = _Map(cfg, cols, rows)
-    events: "queue.Queue[tuple[list[FlowEvent], list[Flow], Stats, float]]" = (
-        queue.Queue()
-    )
+    events: "queue.Queue[_Sample]" = queue.Queue()
     stop = threading.Event()
     table = FlowTable(resolver, poll_ms=cfg.poll_ms)
     collector_thread = _CollectorThread(collector, table, events, cfg.poll_ms, stop)
@@ -1518,7 +1718,7 @@ def _draw(
     stdscr: "curses.window",
     map_: _Map,
     state: _State,
-    events: "queue.Queue[tuple[list[FlowEvent], list[Flow], Stats, float]]",
+    events: "queue.Queue[_Sample]",
     now: float,
     anchor_holder: list[tuple[Geo | None, float | None]],
 ) -> None:
@@ -1561,12 +1761,13 @@ def _draw(
     stats: Stats | None = None
     while True:
         try:
-            events_now, flows_now, stats_now, _ = events.get_nowait()
+            sample = events.get_nowait()
         except queue.Empty:
             break
-        batch.extend(events_now)
-        flows = flows_now
-        stats = stats_now
+        batch.extend(sample.events)
+        flows = sample.flows
+        stats = sample.stats
+        state.bursts = sample.bursts
 
     if flows is not None and stats is not None:
         # The flows of the table are the truth of the map: they are
@@ -1687,7 +1888,11 @@ def snapshot(cfg: Config, path: Path, frames: int) -> int:
             log.info("cannot read the sockets: %s", exc)
             state.error = _error_text(exc)
         else:
-            state.error = None
+            # A collector that works may still have something to say:
+            # the capture of the packets falls back to the sockets
+            # when it is not allowed.
+            state.error = getattr(collector, "warning", None)
+            state.error_label = getattr(collector, "error_label", "collector error")
             if previous is None or now != previous:
                 events = table.update(rows, now)
                 previous = now

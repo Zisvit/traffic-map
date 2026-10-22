@@ -604,14 +604,95 @@ grep -c $'\u28' /tmp/f.txt
 
 ---
 
+# Phase 2: пакетный уровень, зум, точные координаты
+
+Решения пользователя (2026-10-21): сбор пакетов — **tshark отдельным процессом**;
+координаты — **таблица ASN + детерминированный разброс**.
+
+## Task 11: Пакетный сборщик (`tshark`)
+
+**Files:** Create `src/trafficmap/collector_pcap.py`, `tests/test_collector_pcap.py`.
+
+```python
+@dataclass(frozen=True, slots=True)
+class Burst:
+    remote: str        # IP-адрес пира
+    bytes: int         # байт за окно
+    packets: int       # пакетов за окно
+    proto: str         # "tcp" | "udp"
+
+class PcapCollector:
+    def __init__(self, interface: str, command: list[str] | None = None,
+                 process_lookup: Callable[[], dict[int, tuple[int | None, str | None]]] | None = None) -> None
+    def poll(self) -> list[SocketRow]: ...
+    def drain_bursts(self) -> list[Burst]: ...
+    def close(self) -> None: ...
+```
+
+- Запускает `tshark -i <iface> -n -l -T fields -e frame.time_epoch -e ip.src -e ip.dst
+  -e ipv6.src -e ipv6.dst -e ip.proto -e ip.len -e tcp.srcport -e tcp.dstport
+  -e udp.srcport -e udp.dstport -E separator=, -E occurrence=f`; stdout построчно в
+  фоновом потоке, `bufsize=1`; stderr в PIPE (для диагностики).
+- Свой адрес определяется через `ip -j addr show` (fallback: адреса из таблицы сокетов);
+  пакет, у которого src — наш адрес, считается исходящим, dst — нашим — входящим;
+  если обе стороны свои — пакет локальный (пропускаем, считаем в `local`).
+- Каждому 5-кортежу соответствует накопительный счётчик байт; `poll()` возвращает
+  `SocketRow` с теми же кумулятивными счётчиками, что и у `ss`-коллектора, поэтому
+  `FlowTable` работает без изменений. Ключ строки — тот же формат.
+- Счётчики не обнуляются при простое (иначе дельта выглядит как ресет); старые
+  5-кортежи вытесняются только при простое > 60 с.
+- `drain_bursts()` отдаёт накопленные за 100 мс окна по каждому пиру — для
+  «искр» на карте.
+- Имя процесса берётся из `process_lookup()` (карта `local_port → (pid, process)`),
+  источник — таблица сокетов `ss`; при отсутствии — `None`.
+- Ошибка прав (`Operation not permitted`) → `RuntimeError` с ТОЧНОЙ командой
+  `sudo setcap cap_net_raw,cap_net_admin=eip $(command -v dumpcap)`.
+- Ошибка запуска tshark → `RuntimeError` с указанием установить tshark.
+- Остановка процесса tshark → `RuntimeError` (UI покажет баннер и перезапустит).
+
+## Task 12: Искры пакетов (Pulse)
+
+- `anim.py`: класс `Pulse` (TTL 0.8 с, вес = байты окна), `Animator.spawn_pulse(geo, weight, now)`,
+  пул ограничен 400 импульсами, стиль 8 (яркая искра).
+- `ui.py`: очередь коллектора получает пакетные всплески; UI вызывает `spawn_pulse`
+  для каждого; в статус-баре добавляется счётчик `pkt/s`.
+- Всплеск рисуется в точке пира; при большом весе — 2×2 точки (ярче).
+
+## Task 13: Непрерывный зум и резкая карта
+
+- Мышь: `curses.mousemask(...)`, колесо (`BUTTON_WHEELUP/DOWN`) меняет масштаб
+  непрерывно (шаг 1.25), точка под курсором остаётся на месте (zoom-to-cursor).
+- Клавиши: `+`/`-` — ступенчатый зум, `1`/`2`/`3` — пресеты (мир / регион / страна),
+  `0` — сброс к миру.
+- `worldmap.rasterize(geojson, width, height, viewport=None)`: при заданном вьюпорте
+  полигоны проецируются вьюпортом → береговая линия резкая на любом зуме.
+  Кэш ключуется размером + центром + охватом.
+
+## Task 14: Точные координаты (таблица ASN + разброс)
+
+- Новый модуль `src/trafficmap/asn_coords.py`: словарь `ASN → (lat, lon, label)` для
+  ~60 крупных сетей (AWS, Hetzner, OVH, DigitalOcean, Cloudflare, Google, Akamai,
+  Telegram, VK, Ростелеком и т.п.) с координатами основной точки присутствия.
+- `geo.GeoResolver.lookup()`: приоритет — таблица ASN → город из DB-IP; при отсутствии
+  таблицы — город из DB-IP + детерминированный разброс ±0.25° (sha1 от IP, стабильный
+  между запусками), чтобы разные хосты не слипались в одну точку.
+- Документация честно называет разброс декоративным (разделение пиров), а не
+  ростом точности; anycast-сети представлены своей основной точкой.
+
+---
+
 ## Self-Review
 
 - **Покрытие спеки:** конфиг (T1), проекция (T2), Braille (T3), карта/ассеты (T4),
   гео/anchor (T5), `ss` (T6), флоу/статистика (T7), анимация (T8), UI/snapshot (T9),
-  ascii/no-root/доки (T10). Не-цели не реализуются.
+  ascii/no-root/доки (T10), пакетный сборщик (T11), искры (T12), зум (T13),
+  координаты (T14).
 - **Плейсхолдеров нет:** все шаги содержат команды, код или точные требования.
 - **Согласованность типов:** `SocketRow.remote: tuple[str,int]`, `Geo`, `Flow.key`,
   `Opened/Updated/Closed` используются одинаково в T6–T9. `Canvas` API
   (`set/line/blit_land/cell_char/cell_style`) совпадает в T3 и T9. `Viewport`
   (`width/height/center_lat/center_lon/lon_span/lat_span`) — в T2, T8, T9.
-- **Пробелы:** M5 (eBPF/UDP) сознательно вне плана — backlog из спеки.
+- **Обратная совместимость:** `PcapCollector` реализует тот же `poll() -> list[SocketRow]`,
+  поэтому `FlowTable` и аниматор не меняются; `--capture ss` остаётся рабочим режимом
+  без привилегий.
+- **Пробелы:** eBPF-учёт per-process остаётся вне плана (нет bpftrace/bpftool в системе).

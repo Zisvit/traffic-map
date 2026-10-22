@@ -219,3 +219,39 @@ def test_config_is_frozen():
     cfg = load_config([], path=Path("/nonexistent/nope.toml"))
     with pytest.raises(FrozenInstanceError):
         cfg.fps = 99  # type: ignore[misc]
+
+
+def test_the_packets_are_read_by_default():
+    cfg = load_config([], path=Path("/nonexistent/nope.toml"))
+    assert cfg.capture == "pcap"
+    assert cfg.iface == ""
+
+
+def test_the_capture_mode_comes_from_the_command_line(tmp_path):
+    cfg = load_config(
+        ["--capture", "ss", "--iface", "wlp4s0"],
+        path=tmp_path / "none.toml",
+    )
+    assert cfg.capture == "ss"
+    assert cfg.iface == "wlp4s0"
+
+
+def test_the_capture_mode_comes_from_the_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("TMAP_CAPTURE", "ss")
+    monkeypatch.setenv("TMAP_IFACE", "tailscale0")
+    cfg = load_config([], path=tmp_path / "none.toml")
+    assert cfg.capture == "ss"
+    assert cfg.iface == "tailscale0"
+
+
+def test_the_capture_mode_comes_from_the_file(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text('capture = "ss"\niface = "docker0"\n')
+    cfg = load_config([], path=p)
+    assert cfg.capture == "ss"
+    assert cfg.iface == "docker0"
+
+
+def test_an_unknown_capture_mode_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="capture"):
+        load_config(["--capture", "tap"], path=tmp_path / "none.toml")
