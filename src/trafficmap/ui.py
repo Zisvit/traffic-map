@@ -488,12 +488,19 @@ class _State:
 
         The error is ``None`` when the last poll of the collector
         worked.
+
+        The collector may switch from the packets to the sockets while
+        the map is shown: the capture of the packets is not allowed and
+        the sockets are read instead.  The warning about the privileges
+        follows the collector, so it appears as soon as the map shows
+        the sockets and not the packets.
         """
         collector = self.collector
         self.error = collector.error if collector is not None else None
         self.error_label = (
             collector.error_label if collector is not None else "collector error"
         )
+        self.sockets_only = collector.sockets_only if collector is not None else False
 
 
 class _Map:
@@ -1685,17 +1692,24 @@ def _status_lines(
     second = [(" · ".join(items)[: map_.cols], _C_DEFAULT)]
 
     third: list[tuple[str, int]] = []
+    # The warnings stay whatever the width of the terminal is: they say
+    # what the map shows and what is broken with it.
+    fixed: list[tuple[str, int]] = []
     parts: list[tuple[str, int]] = []
-    if state.error:
-        # The collector is down: the banner comes first, it is the
-        # most important thing the user has to know.
-        parts.append((f"{state.error_label}: {state.error}", _C_WARNING))
     sockets_without_root = state.sockets_only and not _is_root()
     if sockets_without_root:
         # Not root and the sockets are read: they show only the
         # sockets of the user.  With root, or with the packets of the
         # machine, this warning would be a lie.
-        parts.append(("no root: only your sockets", _C_WARNING))
+        #
+        # The warning comes before the error of the collector: it is
+        # short, and the error is long enough to be cut by the width
+        # of the terminal.
+        fixed.append(("no root: only your sockets", _C_WARNING))
+    if state.error:
+        # The collector is down: the banner comes first, it is the
+        # most important thing the user has to know.
+        fixed.append((f"{state.error_label}: {state.error}", _C_WARNING))
     parts.append((state.anchor_text, _C_DEFAULT))
     if map_.zoom > MIN_ZOOM:
         viewport = map_.viewport()
@@ -1716,9 +1730,9 @@ def _status_lines(
     parts.append(hints)
     # The last parts are the least important ones: they are the first
     # to go when the line is too long.
-    while len(parts) > 1 and _length(_join(parts)) > map_.cols:
+    while len(parts) > 1 and _length(_join(fixed + parts)) > map_.cols:
         parts.pop()
-    third = _cut(_join(parts), map_.cols)
+    third = _cut(_join(fixed + parts), map_.cols)
 
     return [first, second, third]
 
@@ -1755,6 +1769,9 @@ def _length(segments: list[tuple[str, int]]) -> int:
 def _cut(segments: list[tuple[str, int]], width: int) -> list[tuple[str, int]]:
     """Cut a list of segments to a width.
 
+    The text that does not fit is cut with an ellipsis, so that the
+    user knows that the line says more than it shows.
+
     Args:
         segments: The segments of the line.
         width: The width of the line, in characters.
@@ -1767,9 +1784,12 @@ def _cut(segments: list[tuple[str, int]], width: int) -> list[tuple[str, int]]:
     for text, colour in segments:
         if left <= 0:
             break
-        piece = text[:left]
-        cut.append((piece, colour))
-        left -= len(piece)
+        if len(text) > left:
+            piece = text[: max(0, left - 1)].rstrip() + "…"
+            cut.append((piece, colour))
+            break
+        cut.append((text, colour))
+        left -= len(text)
     return cut
 
 
@@ -2324,6 +2344,23 @@ def _spawn_pulses(state: _State, bursts: list[Burst], now: float) -> None:
         )
 
 
+def _drop_samples(events: "queue.Queue[_Sample]") -> None:
+    """Throw the samples of the collector away.
+
+    The queue is emptied instead of being read: the samples are of no
+    use when the map is not drawn, and a queue that grows without bound
+    would eat the memory of the program.
+
+    Args:
+        events: The queue the collector puts the samples into.
+    """
+    while True:
+        try:
+            events.get_nowait()
+        except queue.Empty:
+            return
+
+
 def _draw(
     stdscr: "curses.window",
     map_: _Map,
@@ -2344,6 +2381,10 @@ def _draw(
     """
     rows, cols = stdscr.getmaxyx()
     if cols < MIN_COLS or rows < MIN_ROWS:
+        # The samples of the collector are thrown away: the map is not
+        # drawn, and a queue that grows without bound would eat the
+        # memory of the program.
+        _drop_samples(events)
         stdscr.erase()
         _addstr(
             stdscr,
@@ -2498,7 +2539,6 @@ def snapshot(cfg: Config, path: Path, frames: int) -> int:
 
     frame: _Frame | None = None
     previous: float | None = None
-    events: list[FlowEvent] = []
     for _ in range(max(1, frames)):
         now = clock()
         try:
@@ -2514,11 +2554,18 @@ def snapshot(cfg: Config, path: Path, frames: int) -> int:
             # when it is not allowed.
             state.error = getattr(collector, "warning", None)
             state.error_label = getattr(collector, "error_label", "collector error")
+            # The collector may fall back to the sockets while the
+            # frames are drawn: the warning about the privileges follows
+            # it, so that the map never claims to show the packets when
+            # it shows the sockets.
+            state.sockets_only = bool(getattr(collector, "sockets_only", False))
             if previous is None or now != previous:
                 events = table.update(rows, now)
                 previous = now
-            for event in events:
-                state.animator.handle_event(event, now)
+                # Only the events of this poll are handled.  The same
+                # events twice would spawn the comets of a flow twice.
+                for event in events:
+                    state.animator.handle_event(event, now)
             state.update(table.flows(), table.stats())
             # The sparks of the packets are put on the frame as well:
             # a demonstration of the packets is a demonstration of the

@@ -103,6 +103,11 @@ def run_dump(
     finally:
         if restore is not None:
             restore()
+        # The collector is stopped as well: the capture of the packets
+        # is a process of its own, and it must not stay behind.
+        close = getattr(collector, "close", None)
+        if close is not None:
+            close()
 
 
 def _poll(

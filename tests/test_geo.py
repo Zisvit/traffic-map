@@ -256,6 +256,62 @@ def test_the_anchor_is_not_moved_to_a_point_of_presence(monkeypatch, tmp_path):
     assert (anchor.lat, anchor.lon) == (37.422, -122.085)
 
 
+def test_the_place_of_an_anycast_network_follows_the_machine(monkeypatch, tmp_path):
+    """The point of presence that answers is the one closest to the machine."""
+    resolver, _, _, _ = make_resolver(
+        monkeypatch,
+        tmp_path,
+        city={"203.0.113.9": CITY_RECORD},
+        asn={"203.0.113.9": CLOUDFLARE_ASN},
+    )
+    # The place of the machine is not known yet: the main point of
+    # presence of the network is used.
+    assert resolver.lookup("203.0.113.9").city == "Amsterdam"
+
+    resolver.set_home(35.6762, 139.6503)
+
+    # The place of the machine is known now: the point of presence
+    # closest to it is the one that answers, and the place that was
+    # cached before is looked up again.
+    assert resolver.lookup("203.0.113.9").city == "Tokyo"
+
+
+def test_the_address_of_the_machine_is_never_moved(monkeypatch, tmp_path):
+    """The machine keeps the place of the database, cache or not."""
+    resolver, _, _, _ = make_resolver(
+        monkeypatch,
+        tmp_path,
+        city={"203.0.113.9": CITY_RECORD},
+        asn={"203.0.113.9": CLOUDFLARE_ASN},
+        scatter=True,
+    )
+    cache = tmp_path / "anchor.json"
+    cache.write_text(
+        json.dumps(
+            {
+                "ip": "203.0.113.9",
+                "lat": 10.0,
+                "lon": 20.0,
+                "country": "US",
+                "city": "Nowhere",
+                "asn": 13335,
+                "org": "Cloudflare",
+                "expires_at": time.time() + 600,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    anchor = resolver.anchor()
+
+    assert anchor is not None and anchor.ip == "203.0.113.9"
+    # The address of the machine is not moved to a point of presence and
+    # is not spread: it is where the database says it is.
+    place = resolver.lookup("203.0.113.9")
+    assert place.city == "Mountain View"
+    assert (place.lat, place.lon) == (37.422, -122.085)
+
+
 def test_lookup_of_a_local_address_skips_the_database(resolver):
     geo_ = resolver.lookup("192.168.1.1")
     assert geo_ == Geo("192.168.1.1", None, None, "--", None, None, None)

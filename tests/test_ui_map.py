@@ -936,6 +936,47 @@ def test_the_banner_of_the_root_needs_the_sockets():
     assert "no root" not in _third_line_of_status(state, map_)
 
 
+def test_the_banner_of_the_root_follows_the_collector(monkeypatch):
+    """The warning appears when the capture falls back to the sockets."""
+    state = _State(Config())
+    map_ = make_map(ANCHOR, 1)
+    monkeypatch.setattr("trafficmap.ui._is_root", lambda: False)
+
+    class _Collector:
+        """A collector that reads the packets, and then the sockets."""
+
+        error = "capture needs privileges"
+        error_label = "capture error"
+        sockets_only = False
+
+    collector = _Collector()
+    state.collector = collector
+    state.read_error()
+    assert "no root" not in _third_line_of_status(state, map_)
+
+    # The capture of the packets failed: the sockets are read now, and
+    # the map says that it does not show the packets of the machine.
+    collector.sockets_only = True
+    state.read_error()
+    assert "no root: only your sockets" in _third_line_of_status(state, map_)
+
+
+def test_the_warnings_stay_in_a_narrow_terminal(monkeypatch):
+    """A long error does not push the warnings out of the status bar."""
+    state = _State(Config())
+    map_ = make_map(ANCHOR, 1)
+    monkeypatch.setattr("trafficmap.ui._is_root", lambda: False)
+    state.sockets_only = True
+    state.error = "capture needs privileges: run as root, or once: sudo setcap"
+    state.error_label = "capture error"
+
+    line = _third_line_of_status(state, map_)
+
+    assert len(line) <= map_.cols
+    assert "no root: only your sockets" in line
+    assert "capture error" in line
+
+
 # -- the fallback from the packets to the sockets ------------------------
 
 

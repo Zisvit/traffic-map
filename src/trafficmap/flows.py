@@ -435,6 +435,13 @@ class FlowTable:
                 opened.append(key)
             else:
                 state.state = row.state
+                if state.geo != geo:
+                    # The place of the address may change: the network
+                    # of an address of a content network answers from
+                    # the city that is closest to this machine, and the
+                    # place of the machine is known only after the
+                    # first poll.
+                    state.geo = geo
             state.last_seen = now
             seen[key] = None
             socket_keys.setdefault(key, set()).add(row.key)

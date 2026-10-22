@@ -156,6 +156,22 @@ def test_a_quiet_poll_says_nothing(resolver):
     assert table.update([row(sent=1000)], now=1.0) == []
 
 
+def test_a_flow_follows_the_place_of_its_address(resolver):
+    """The place of an address may change, and the flow follows it."""
+    table = FlowTable(resolver, poll_ms=1000)
+    table.update([row(sent=1000)], now=0.0)
+    assert table.flows()[0].remote.city == "Mountain View"
+
+    # The place of the machine is known now, and the address of a
+    # network that answers from many cities is placed near it.
+    resolver.places["1.1.1.1"] = Geo(
+        "1.1.1.1", 35.68, 139.65, "JP", "Tokyo", 15169, "Example"
+    )
+    table.update([row(sent=2000)], now=1.0)
+
+    assert table.flows()[0].remote.city == "Tokyo"
+
+
 def test_a_counter_reset_never_goes_negative(resolver):
     table = FlowTable(resolver, poll_ms=1000)
     table.update([row(sent=5000)], now=0.0)

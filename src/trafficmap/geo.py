@@ -83,7 +83,7 @@ from typing import Any, Callable
 
 import maxminddb
 
-from trafficmap.asn_coords import anycast_place
+from trafficmap.asn_coords import ANYCAST_POPS, anycast_place
 
 __all__ = ["Geo", "GeoResolver", "is_local"]
 
@@ -306,11 +306,29 @@ class GeoResolver:
         uses the main point of presence of the network, which can be on
         another continent.
 
+        The places that were looked up before are thrown away when they
+        belong to such a network: they were guessed without the home,
+        and they are looked up again with it.
+
         Args:
             lat: Latitude of the machine, in degrees.
             lon: Longitude of the machine, in degrees.
         """
         self._home = (lat, lon)
+        self._forget_anycast_places()
+
+    def _forget_anycast_places(self) -> None:
+        """Throw the cached places of the networks of many cities away.
+
+        The place of an address of such a network is the point of
+        presence closest to this machine, so it is not known until the
+        place of the machine is known.  The ones that were cached
+        before that are wrong, and the next lookup finds them again.
+        """
+        with self._cache_lock:
+            stale = [key for key, geo in self._cache.items() if geo.asn in ANYCAST_POPS]
+            for key in stale:
+                del self._cache[key]
 
     def lookup(self, ip: str) -> Geo:
         """Resolve one address to its place.
@@ -382,6 +400,10 @@ class GeoResolver:
         cached = self._read_anchor_cache()
         if cached is not None:
             log.debug("anchor from cache: %s", cached.ip)
+            # The address of this machine is never moved: it is where
+            # the database says it is, and not where the network of the
+            # address answers from.
+            self._anchor_ip = _normalize(cached.ip)
             return cached
 
         ip = _fetch_public_ip(deadline=deadline)

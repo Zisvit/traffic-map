@@ -296,15 +296,22 @@ class Peer:
         self.weight = weight
         self.last_seen: float | None = None
 
-    def touch(self, now: float, weight: float) -> None:
+    def touch(self, now: float, weight: float, geo: Geo | None = None) -> None:
         """Note that the peer is alive and say how heavy it is.
 
         Args:
             now: The moment, in seconds.
             weight: How heavy the traffic of the peer is.
+            geo: The place of the peer, when it is known.  The place of
+                an address of a content network is the point of
+                presence closest to this machine, and it changes when
+                the place of the machine becomes known: the dot follows
+                it.
         """
         self.last_seen = now
         self.weight = weight
+        if geo is not None:
+            self.geo = geo
 
     def expired(self, now: float) -> bool:
         """Tell whether the peer is past its life.
@@ -730,7 +737,7 @@ class Animator:
         if peer is None:
             peer = Peer(flow.remote)
             self._peers[flow.key] = peer
-        peer.touch(now, flow.tx_rate + flow.rx_rate)
+        peer.touch(now, flow.tx_rate + flow.rx_rate, flow.remote)
 
     def _spawn_for_update(self, event: Updated, now: float) -> None:
         """Spawn the comet of an update, when the flow deserves one.

@@ -214,6 +214,19 @@ def test_a_touch_keeps_the_peer_alive():
     assert peer.weight == 2.0
 
 
+def test_the_peer_follows_the_place_of_the_flow():
+    """The place of an address may change, and the dot moves with it."""
+    a = Animator()
+    a.anchor = ANCHOR
+    a.handle_event(Opened(flow=flow(remote=GREENWICH)), now=0.0)
+    assert a.peers[0].geo.city == "London"
+
+    a.handle_event(Opened(flow=flow(remote=MOSCOW)), now=1.0)
+
+    assert len(a.peers) == 1
+    assert a.peers[0].geo.city == "Moscow"
+
+
 def test_an_update_below_the_rate_threshold_does_not_spawn():
     a = Animator()
     a.anchor = ANCHOR

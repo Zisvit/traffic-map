@@ -12,8 +12,10 @@ from pathlib import Path
 import pytest
 
 from trafficmap.__main__ import main
+from trafficmap.anim import Animator
 from trafficmap.collector_mock import MockCollector
 from trafficmap.config import Config
+from trafficmap.flows import FlowEvent, Opened
 from trafficmap.ui import (
     MIN_COLS,
     MIN_ROWS,
@@ -207,6 +209,37 @@ def test_the_recording_does_not_warn_about_the_privileges(tmp_path):
     """A recording is not the sockets of the user: no banner belongs to it."""
     text = make_snapshot(tmp_path)
     assert "no root" not in text
+
+
+def test_the_snapshot_handles_every_event_once(monkeypatch, tmp_path):
+    """A frame does not repeat the events of the poll before it."""
+    handled: list[FlowEvent] = []
+    original = Animator.handle_event
+
+    def counting(self, event, now):
+        """Remember the event and let the animator have it."""
+        handled.append(event)
+        original(self, event, now)
+
+    monkeypatch.setattr(Animator, "handle_event", counting)
+    out = snapshot_path(tmp_path)
+    rc = main(
+        [
+            "--mock",
+            str(FIXTURE),
+            "--snapshot",
+            str(out),
+            "--frames",
+            "30",
+            "--no-anchor",
+        ]
+    )
+    assert rc == 0
+    opened = [event.flow.key for event in handled if isinstance(event, Opened)]
+    assert opened
+    # Every flow of the recording is opened once, and the frames that
+    # follow the poll do not open it again.
+    assert len(opened) == len(set(opened))
 
 
 def test_snapshot_to_a_missing_directory_fails(tmp_path, capsys):

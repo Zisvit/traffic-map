@@ -14,6 +14,7 @@ import time
 
 import pytest
 
+from trafficmap.__main__ import _place_the_machine
 from trafficmap.collector_ss import SocketRow
 from trafficmap.config import Config
 from trafficmap.dump import dump_events, run_dump
@@ -71,6 +72,15 @@ class FakeCollector:
     def __init__(self, polls=2):
         self.polls = polls
         self.calls = 0
+        self.closed = False
+
+    def close(self):
+        """Remember that the collector was closed.
+
+        The capture of the packets is a process of its own, and it must
+        not stay behind the dump.
+        """
+        self.closed = True
 
     def poll(self):
         """Return the sockets of one poll.
@@ -208,6 +218,65 @@ def test_run_dump_writes_the_events_of_every_poll(tmp_path):
 def test_run_dump_needs_a_path():
     with pytest.raises(ValueError):
         run_dump(Config(), FakeResolver(), FakeCollector(polls=0))
+
+
+def test_run_dump_closes_the_collector(tmp_path):
+    """The collector is stopped: the capture must not stay behind."""
+    collector = FakeCollector(polls=2)
+    path = tmp_path / "flows.jsonl"
+    cfg = Config(dump=path, poll_ms=10)
+    assert run_dump(cfg, FakeResolver(), collector) == 0
+    assert collector.closed is True
+
+
+class _PlacedResolver:
+    """A resolver that remembers where the machine is."""
+
+    def __init__(self, anchor=None):
+        self.anchor_geo = anchor
+        self.home = None
+
+    def set_home(self, lat, lon):
+        """Remember the place of the machine.
+
+        Args:
+            lat: Latitude of the machine, in degrees.
+            lon: Longitude of the machine, in degrees.
+        """
+        self.home = (lat, lon)
+
+    def anchor(self):
+        """Return the place of the machine.
+
+        Returns:
+            The place of the machine, or ``None`` when it is not known.
+        """
+        return self.anchor_geo
+
+
+def test_the_dump_knows_where_the_machine_is():
+    """The points of presence of the dump are the ones near the machine."""
+    resolver = _PlacedResolver(
+        Geo("1.1.1.1", 52.3676, 4.9041, "NL", "Amsterdam", 64500, "Example")
+    )
+    _place_the_machine(resolver, Config())
+    assert resolver.home == (52.3676, 4.9041)
+
+
+def test_the_dump_takes_the_anchor_of_the_configuration():
+    """A point given by hand is the place of the machine."""
+    resolver = _PlacedResolver()
+    _place_the_machine(resolver, Config(anchor=(52.3676, 4.9041)))
+    assert resolver.home == (52.3676, 4.9041)
+
+
+def test_the_dump_does_not_look_for_the_machine_when_it_is_told_not_to():
+    """``--no-anchor`` keeps the dump away from the network."""
+    resolver = _PlacedResolver(
+        Geo("1.1.1.1", 52.3676, 4.9041, "NL", "Amsterdam", 64500, "Example")
+    )
+    _place_the_machine(resolver, Config(no_anchor=True))
+    assert resolver.home is None
 
 
 def test_run_dump_survives_a_failing_collector(tmp_path):

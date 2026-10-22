@@ -142,10 +142,40 @@ def _run_dump(cfg: Config) -> int:
         # The mock collector is used when a recording is named, so
         # that the dump can be made without the sockets of the
         # machine.
-        return run_dump(cfg, resolver, make_collector(cfg))
+        collector = make_collector(cfg)
+    except OSError as exc:
+        print(f"tmap: cannot read the recording: {exc}", file=sys.stderr)
+        return 2
+    _place_the_machine(resolver, cfg)
+    try:
+        return run_dump(cfg, resolver, collector)
     except OSError as exc:
         print(f"tmap: cannot write the dump: {exc}", file=sys.stderr)
         return 2
+
+
+def _place_the_machine(resolver: GeoResolver, cfg: Config) -> None:
+    """Tell the resolver where this machine is.
+
+    The place of the machine is what chooses the point of presence of
+    a network that answers from many cities: without it the traffic of
+    the machine is placed in the city of the office of the network,
+    which may be on another continent.  The dump shows the same places
+    as the map, so it looks for the anchor as well.
+
+    Args:
+        resolver: The resolver that knows the places.
+        cfg: The configuration of the program.
+    """
+    if cfg.anchor is not None:
+        lat, lon = cfg.anchor
+        resolver.set_home(lat, lon)
+        return
+    if cfg.no_anchor:
+        return
+    geo = resolver.anchor()
+    if geo is not None and geo.lat is not None and geo.lon is not None:
+        resolver.set_home(geo.lat, geo.lon)
 
 
 if __name__ == "__main__":
