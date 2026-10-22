@@ -17,6 +17,11 @@ The three kinds of element
   tail is a handful of older points that fade with their age: the
   newest ones are bright (style 5), the middle ones are half bright
   (style 3) and the oldest ones are dim (style 2).
+* A **pulse** is one packet, or the handful of packets of one peer
+  that were read together: a bright spark in style 9 that lives
+  :data:`PULSE_TTL` seconds and turns dim (style 8) before it goes
+  out.  The comets show the flows, the pulses show the packets: a
+  connection that is too short for a comet still sparks.
 * The **anchor** is our own place on the map, a single dot in style 7.
 
 The direction of a comet says which way the bytes went: ``"out"`` for
@@ -75,15 +80,22 @@ __all__ = [
     "COMET_TTL",
     "Comet",
     "MAX_COMETS",
+    "MAX_PULSES",
     "MIN_SPAWN_RATE",
     "PATH_SAMPLES",
     "PEER_TTL",
+    "PULSE_BIG_BYTES",
+    "PULSE_FADE",
+    "PULSE_TTL",
     "Peer",
+    "Pulse",
     "SPAWN_COOLDOWN",
     "STYLE_ANCHOR",
     "STYLE_COMET_HEAD",
     "STYLE_LAND",
     "STYLE_PEER",
+    "STYLE_PULSE",
+    "STYLE_PULSE_DIM",
     "STYLE_TRAIL_BRIGHT",
     "STYLE_TRAIL_DIM",
     "STYLE_TRAIL_MID",
@@ -111,6 +123,12 @@ STYLE_COMET_HEAD = 6
 #: Style of the anchor.
 STYLE_ANCHOR = 7
 
+#: Style of a pulse that is going out.
+STYLE_PULSE_DIM = 8
+
+#: Style of a pulse that has just been born.
+STYLE_PULSE = 9
+
 #: Rate a flow must exceed before a comet is spawned for it, in bytes
 #: per second: 32 KiB/s.
 MIN_SPAWN_RATE = 32 * 1024
@@ -124,11 +142,24 @@ PEER_TTL = 10.0
 #: Life of a comet, in seconds.
 COMET_TTL = 1.2
 
+#: Life of a pulse, in seconds.
+PULSE_TTL = 0.7
+
+#: Share of the life of a pulse after which it is drawn dim.
+PULSE_FADE = 0.55
+
+#: Weight from which a pulse is drawn as a block of four dots, in
+#: bytes: 8 KiB in one poll.
+PULSE_BIG_BYTES = 8 * 1024
+
 #: Number of points of the tail of a comet.
 TRAIL_LENGTH = 12
 
 #: Greatest number of comets that live at the same time.
 MAX_COMETS = 200
+
+#: Greatest number of pulses that live at the same time.
+MAX_PULSES = 400
 
 #: Number of samples of the great circle a comet flies along.
 #:
@@ -292,43 +323,122 @@ class Peer:
         return now - self.last_seen > PEER_TTL
 
 
+class Pulse:
+    """The packets of one peer, shown as a spark.
+
+    A pulse is born when the packets it stands for happened, and not
+    when they were read: the caller gives the moment of the newest
+    packet, so a slow poll leaves a trail of sparks instead of one
+    flash for the whole poll.
+
+    Args:
+        geo: The place of the peer.
+        born: The moment the pulse appeared, in seconds.
+        ttl: How long the pulse lives, in seconds.
+        weight: The bytes the packets carried.  A heavy burst is drawn
+            as a block of four dots, a light one as a single dot.
+        flow_key: The key of the flow the pulse belongs to.  It is
+            empty when the pulse does not belong to a flow, and it is
+            what the filter of the process hides the pulse by.
+
+    Raises:
+        ValueError: If the life is not positive.
+    """
+
+    __slots__ = ("geo", "born", "ttl", "weight", "flow_key")
+
+    def __init__(
+        self,
+        geo: Geo,
+        born: float,
+        ttl: float = PULSE_TTL,
+        weight: float = 0.0,
+        flow_key: str = "",
+    ) -> None:
+        if ttl <= 0:
+            raise ValueError(f"ttl must be positive, got {ttl}")
+        self.geo = geo
+        self.born = born
+        self.ttl = ttl
+        self.weight = weight
+        self.flow_key = flow_key
+
+    def expired(self, now: float) -> bool:
+        """Tell whether the pulse is past its life.
+
+        Args:
+            now: The moment, in seconds.
+
+        Returns:
+            ``True`` when the pulse lived longer than its life.
+        """
+        return now - self.born > self.ttl
+
+    def bright(self, now: float) -> bool:
+        """Tell whether the pulse is still bright.
+
+        Args:
+            now: The moment, in seconds.
+
+        Returns:
+            ``True`` while the pulse is young, ``False`` when it is
+            going out.
+        """
+        return (now - self.born) / self.ttl < PULSE_FADE
+
+
 class Animator:
-    """The animation of the map: the peers and the comets.
+    """The animation of the map: the peers, the comets and the pulses.
 
     The animator is driven by the events of the flow table: every
     event is handed over with :meth:`handle_event`, and the frame is
     drawn with :meth:`draw`.  Both happen in the thread of the user
     interface, so no lock is needed.
 
+    The pulses do not come from the flow table: they come from the
+    packets, and the interface hands them over with
+    :meth:`spawn_pulse`.
+
     Args:
         max_comets: The greatest number of comets that live at the
             same time.  The oldest one is pushed out when the limit is
             reached.
         trail_length: The number of points of the tail of a comet.
+        max_pulses: The greatest number of pulses that live at the
+            same time.  The oldest one is pushed out when the limit is
+            reached.
 
     Raises:
-        ValueError: If the limit of the comets or the length of the
-            tail is not positive.
+        ValueError: If a limit or the length of the tail is not
+            positive.
     """
 
     __slots__ = (
         "anchor",
         "max_comets",
+        "max_pulses",
         "trail_length",
         "_comets",
         "_hidden",
         "_peers",
         "_last_spawn",
+        "_pulses",
     )
 
     def __init__(
-        self, max_comets: int = MAX_COMETS, trail_length: int = TRAIL_LENGTH
+        self,
+        max_comets: int = MAX_COMETS,
+        trail_length: int = TRAIL_LENGTH,
+        max_pulses: int = MAX_PULSES,
     ) -> None:
         if max_comets < 1:
             raise ValueError(f"max_comets must be positive, got {max_comets}")
         if trail_length < 1:
             raise ValueError(f"trail_length must be positive, got {trail_length}")
+        if max_pulses < 1:
+            raise ValueError(f"max_pulses must be positive, got {max_pulses}")
         self.max_comets = max_comets
+        self.max_pulses = max_pulses
         self.trail_length = trail_length
         #: The place of this machine, without it there is no route and
         #: no comet.
@@ -336,6 +446,7 @@ class Animator:
         self._comets: list[Comet] = []
         self._peers: dict[str, Peer] = {}
         self._last_spawn: dict[str, float] = {}
+        self._pulses: list[Pulse] = []
         #: The keys of the flows that are not on the map.  The peers
         #: and the comets of those flows are kept, they are only not
         #: drawn.
@@ -345,6 +456,11 @@ class Animator:
     def comets(self) -> list[Comet]:
         """The comets that are alive, the oldest one first."""
         return list(self._comets)
+
+    @property
+    def pulses(self) -> list[Pulse]:
+        """The pulses that are alive, the oldest one first."""
+        return list(self._pulses)
 
     @property
     def peers(self) -> list[Peer]:
@@ -429,13 +545,40 @@ class Animator:
         if flow_key:
             self._last_spawn[flow_key] = now
 
+    def spawn_pulse(
+        self,
+        geo: Geo,
+        born: float,
+        weight: float = 0.0,
+        flow_key: str = "",
+    ) -> None:
+        """Put a spark of packets on the map.
+
+        The pulse is born at the moment its packets happened and lives
+        :data:`PULSE_TTL` seconds.  The oldest pulse is pushed out when
+        there are too many of them.  A place that is not known has no
+        spark.
+
+        Args:
+            geo: The place of the peer.
+            born: The moment the packets happened, in seconds.
+            weight: The bytes the packets carried.
+            flow_key: The key of the flow of the packets.
+        """
+        if geo.lat is None or geo.lon is None:
+            return
+        self._pulses.append(Pulse(geo, born=born, weight=weight, flow_key=flow_key))
+        while len(self._pulses) > self.max_pulses:
+            self._pulses.pop(0)
+
     def prune(self, now: float) -> None:
-        """Take the comets and the peers that are past their life out.
+        """Take the comets, the peers and the pulses that are past their life out.
 
         Args:
             now: The moment, in seconds.
         """
         self._comets = [comet for comet in self._comets if not comet.expired(now)]
+        self._pulses = [pulse for pulse in self._pulses if not pulse.expired(now)]
         self._peers = {
             key: peer for key, peer in self._peers.items() if not peer.expired(now)
         }
@@ -468,6 +611,7 @@ class Animator:
         self._draw_anchor(canvas, viewport, spot)
         self._draw_peers(canvas, viewport, now)
         self._draw_comets(canvas, viewport, now)
+        self._draw_pulses(canvas, viewport, now)
 
     def _draw_anchor(
         self, canvas: Canvas, viewport: Viewport, anchor: Geo | None
@@ -544,6 +688,36 @@ class Animator:
                     previous[0], previous[1], point[0], point[1], STYLE_TRAIL_BRIGHT
                 )
             canvas.set(point[0], point[1], STYLE_COMET_HEAD)
+
+    def _draw_pulses(self, canvas: Canvas, viewport: Viewport, now: float) -> None:
+        """Draw every pulse that is alive as a spark.
+
+        A pulse is a single dot, or a block of four dots when it
+        carries a heavy burst.  The pulses of the hidden flows are not
+        drawn, but they are kept: they come back as soon as the flow is
+        not hidden any more.
+
+        Args:
+            canvas: The canvas to draw on.
+            viewport: The part of the world the canvas shows.
+            now: The moment of the frame, in seconds.
+        """
+        for pulse in self._pulses:
+            if pulse.expired(now):
+                continue
+            if pulse.flow_key and pulse.flow_key in self._hidden:
+                continue
+            geo = pulse.geo
+            if geo.lat is None or geo.lon is None:
+                continue
+            point = project(geo.lat, geo.lon, viewport)
+            if point is None:
+                continue
+            style = STYLE_PULSE if pulse.bright(now) else STYLE_PULSE_DIM
+            size = 2 if pulse.weight >= PULSE_BIG_BYTES else 1
+            for dy in range(size):
+                for dx in range(size):
+                    canvas.set(point[0] + dx, point[1] + dy, style)
 
     def _touch_peer(self, flow: Flow, now: float) -> None:
         """Note that the peer of a flow is alive.

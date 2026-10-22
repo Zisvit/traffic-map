@@ -9,13 +9,19 @@ import pytest
 from trafficmap.anim import (
     COMET_TTL,
     MAX_COMETS,
+    MAX_PULSES,
     MIN_SPAWN_RATE,
     PEER_TTL,
+    PULSE_BIG_BYTES,
+    PULSE_TTL,
     SPAWN_COOLDOWN,
+    STYLE_PULSE,
+    STYLE_PULSE_DIM,
     TRAIL_LENGTH,
     Animator,
     Comet,
     Peer,
+    Pulse,
 )
 from trafficmap.braille import Canvas
 from trafficmap.flows import Closed, Flow, Opened, Updated
@@ -472,3 +478,87 @@ def test_an_expired_peer_is_not_drawn():
     canvas = Canvas(100, 50)
     a.draw(canvas, WORLD, now=PEER_TTL + 0.1)
     assert 4 not in styles_on(canvas)
+
+
+# -- the pulses of the packets -----------------------------------------
+
+
+def test_a_pulse_is_drawn_as_a_spark():
+    a = Animator()
+    a.spawn_pulse(GREENWICH, born=0.0, weight=100.0)
+    canvas = Canvas(100, 50)
+    a.draw(canvas, WORLD, now=0.0)
+    x, y = project(GREENWICH.lat, GREENWICH.lon, WORLD)
+    assert canvas.dot_style(x, y) == STYLE_PULSE
+    assert STYLE_PULSE in styles_on(canvas)
+
+
+def test_a_pulse_turns_dim_before_it_goes_out():
+    a = Animator()
+    a.spawn_pulse(GREENWICH, born=0.0, weight=1.0)
+    canvas = Canvas(100, 50)
+    a.draw(canvas, WORLD, now=PULSE_TTL * 0.9)
+    x, y = project(GREENWICH.lat, GREENWICH.lon, WORLD)
+    assert canvas.dot_style(x, y) == STYLE_PULSE_DIM
+
+
+def test_an_expired_pulse_is_taken_away():
+    a = Animator()
+    a.spawn_pulse(GREENWICH, born=0.0)
+    a.prune(PULSE_TTL + 0.1)
+    assert a.pulses == []
+
+
+def test_a_heavy_pulse_is_a_block_of_four_dots():
+    a = Animator()
+    a.spawn_pulse(GREENWICH, born=0.0, weight=PULSE_BIG_BYTES)
+    canvas = Canvas(100, 50)
+    a.draw(canvas, WORLD, now=0.0)
+    x, y = project(GREENWICH.lat, GREENWICH.lon, WORLD)
+    for dy in range(2):
+        for dx in range(2):
+            assert canvas.dot_style(x + dx, y + dy) == STYLE_PULSE
+
+
+def test_a_light_pulse_is_a_single_dot():
+    a = Animator()
+    a.spawn_pulse(GREENWICH, born=0.0, weight=PULSE_BIG_BYTES - 1)
+    canvas = Canvas(100, 50)
+    a.draw(canvas, WORLD, now=0.0)
+    x, y = project(GREENWICH.lat, GREENWICH.lon, WORLD)
+    assert canvas.dot_style(x, y) == STYLE_PULSE
+    assert canvas.dot_style(x + 1, y) == 0
+
+
+def test_the_pulse_of_a_hidden_flow_is_not_drawn():
+    a = Animator()
+    a.spawn_pulse(GREENWICH, born=0.0, flow_key="1.1.1.1|100|tcp")
+    a.set_hidden({"1.1.1.1|100|tcp"})
+    canvas = Canvas(100, 50)
+    a.draw(canvas, WORLD, now=0.0)
+    assert STYLE_PULSE not in styles_on(canvas)
+
+
+def test_the_animator_caps_the_pulses():
+    a = Animator(max_pulses=3)
+    for index in range(10):
+        a.spawn_pulse(GREENWICH, born=float(index))
+    assert len(a.pulses) == 3
+    assert MAX_PULSES > 0
+
+
+def test_a_place_that_is_not_known_has_no_spark():
+    a = Animator()
+    unknown = Geo("1.1.1.1", None, None, "--", None, None, None)
+    a.spawn_pulse(unknown, born=0.0)
+    assert a.pulses == []
+
+
+def test_a_pulse_needs_a_life():
+    with pytest.raises(ValueError):
+        Pulse(GREENWICH, born=0.0, ttl=0.0)
+
+
+def test_the_animator_refuses_an_impossible_number_of_pulses():
+    with pytest.raises(ValueError):
+        Animator(max_pulses=0)

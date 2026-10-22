@@ -25,6 +25,7 @@ from trafficmap.anim import (
     Animator,
 )
 from trafficmap.braille import Canvas
+from trafficmap.collector_pcap import Burst
 from trafficmap.config import Config
 from trafficmap.flows import Flow, FlowTable, Opened, Stats
 from trafficmap.geo import Geo, GeoResolver
@@ -45,6 +46,7 @@ from trafficmap.ui import (
     _format_rate,
     _handle_key,
     _in_cells,
+    _spawn_pulses,
     _status_lines,
     _text_rows,
     _top_panel,
@@ -720,3 +722,71 @@ def test_the_escape_key_takes_the_filter_away():
     assert state.hidden == set()
     line = "".join(part for part, _ in _status_lines(map_, state, state.stats)[2])
     assert "filter:" not in line
+
+
+# -- the sparks of the packets -----------------------------------------
+
+
+def test_the_bursts_of_the_packets_become_sparks():
+    state = _State(Config())
+    flow = make_flow("1.1.1.1|100|tcp", "curl", LOCAL_PEER)
+    state.update([flow], stats_of([flow]))
+    burst = Burst(
+        remote=LOCAL_PEER.ip, bytes=2048, packets=12, proto="tcp", age=0.25
+    )
+    _spawn_pulses(state, [burst], now=10.0)
+    pulses = state.animator.pulses
+    assert len(pulses) == 1
+    assert pulses[0].geo == LOCAL_PEER
+    assert pulses[0].born == pytest.approx(9.75)
+    assert pulses[0].weight == 2048
+    assert pulses[0].flow_key == flow.key
+
+
+def test_a_burst_of_a_peer_without_a_flow_has_no_spark():
+    state = _State(Config())
+    burst = Burst(remote="9.9.9.9", bytes=100, packets=1, proto="tcp")
+    _spawn_pulses(state, [burst], now=1.0)
+    assert state.animator.pulses == []
+
+
+def test_the_rate_of_the_packets_is_smoothed():
+    state = _State(Config())
+    flow = make_flow("1.1.1.1|100|tcp", "curl", LOCAL_PEER)
+    state.update([flow], stats_of([flow]))
+
+    def burst(packets: int) -> Burst:
+        return Burst(
+            remote=LOCAL_PEER.ip,
+            bytes=packets * 100,
+            packets=packets,
+            proto="tcp",
+        )
+
+    _spawn_pulses(state, [burst(50)], now=1.0)
+    assert state.packet_rate == 0.0
+    _spawn_pulses(state, [burst(50)], now=2.0)
+    assert state.packet_rate == pytest.approx(50.0)
+    _spawn_pulses(state, [burst(10)], now=3.0)
+    assert state.packet_rate == pytest.approx(0.7 * 50 + 0.3 * 10)
+
+
+def test_the_rate_of_the_packets_is_forgotten_when_they_stop():
+    state = _State(Config())
+    flow = make_flow("1.1.1.1|100|tcp", "curl", LOCAL_PEER)
+    state.update([flow], stats_of([flow]))
+    burst = Burst(remote=LOCAL_PEER.ip, bytes=100, packets=50, proto="tcp")
+    _spawn_pulses(state, [burst], now=1.0)
+    _spawn_pulses(state, [burst], now=2.0)
+    assert state.packet_rate > 0
+    _spawn_pulses(state, [], now=5.0)
+    assert state.packet_rate == 0.0
+
+
+def test_the_status_bar_shows_the_rate_of_the_packets():
+    state = _State(Config())
+    state.packet_rate = 1234.0
+    map_ = make_map(ANCHOR, 1)
+    lines = _status_lines(map_, state, state.stats)
+    text = "".join(part for part, _ in lines[0])
+    assert "1.2k pkt/s" in text

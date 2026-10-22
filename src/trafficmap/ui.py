@@ -73,6 +73,8 @@ from trafficmap.anim import (
     STYLE_COMET_HEAD,
     STYLE_LAND,
     STYLE_PEER,
+    STYLE_PULSE,
+    STYLE_PULSE_DIM,
     STYLE_TRAIL_BRIGHT,
     STYLE_TRAIL_DIM,
     STYLE_TRAIL_MID,
@@ -101,6 +103,10 @@ log = logging.getLogger(__name__)
 
 #: Number of lines of the status bar.
 STATUS_ROWS = 3
+
+#: Seconds without packets after which the rate of the packets is
+#: forgotten.
+PACKET_RATE_TTL = 2.0
 
 #: Smallest terminal the map is drawn on.
 MIN_COLS = 80
@@ -179,6 +185,7 @@ _PALETTE: tuple[_Colour, ...] = (
     _Colour(curses.COLOR_YELLOW, -1, curses.A_BOLD),  # 10: a warning
     _Colour(curses.COLOR_WHITE, curses.COLOR_BLUE, 0),  # 11: a panel
     _Colour(curses.COLOR_WHITE, -1, curses.A_DIM),  # 12: a country label
+    _Colour(curses.COLOR_MAGENTA, -1, curses.A_BOLD),  # 13: a pulse
 )
 
 _C_DEFAULT = 0
@@ -190,6 +197,7 @@ _C_IN = (7, 8, 9)
 _C_WARNING = 10
 _C_PANEL = 11
 _C_LABEL = 12
+_C_PULSE = 13
 
 #: The colour of every style of the canvas, for the comets that leave.
 _OUT_BY_STYLE: dict[int, int] = {
@@ -213,6 +221,8 @@ _PLAIN_BY_STYLE: dict[int, int] = {
     STYLE_LAND: _C_LAND,
     STYLE_PEER: _C_PEER,
     STYLE_ANCHOR: _C_ANCHOR,
+    STYLE_PULSE: _C_PULSE,
+    STYLE_PULSE_DIM: _C_PULSE,
 }
 
 #: The glyph of every style of the canvas, for the ASCII mode.  The
@@ -226,6 +236,8 @@ _ASCII_GLYPHS: dict[int, str] = {
     STYLE_PEER: "*",
     STYLE_COMET_HEAD: "+",
     STYLE_ANCHOR: "O",
+    STYLE_PULSE: "*",
+    STYLE_PULSE_DIM: "*",
 }
 
 #: The glyph of a cell whose style is not known.
@@ -334,8 +346,11 @@ class _State:
         self.error: str | None = None
         #: The words that tell the user what is broken.
         self.error_label = "collector error"
-        #: The bursts of the packets of the last poll, by peer.
-        self.bursts: list[Burst] = []
+        #: The rate of the packets that were read, in packets per
+        #: second.  It is zero when the packets are not read.
+        self.packet_rate = 0.0
+        #: The moment of the last poll that carried packets.
+        self.packet_time: float | None = None
         #: The clock of the animation.  It stands still while the map
         #: is paused, so that the map is frozen as a whole.
         self.now = 0.0
@@ -694,6 +709,21 @@ def _format_rate(value: float) -> str:
         if number < scale * 1000.0:
             return f"{number / scale:.1f} {unit}/s"
     return f"{number / _RATE_UNITS[-1][1]:.1f} PB/s"
+
+
+def _format_packets(value: float) -> str:
+    """Format a rate of packets per second.
+
+    Args:
+        value: The rate, in packets per second.
+
+    Returns:
+        The rate, ``"834 pkt/s"`` or ``"12.4k pkt/s"`` for example.
+    """
+    number = float(value)
+    if number < 1000.0:
+        return f"{int(number)} pkt/s"
+    return f"{number / 1000.0:.1f}k pkt/s"
 
 
 def _is_root() -> bool:
@@ -1198,6 +1228,8 @@ def _status_lines(
     ]
     if stats.unknown:
         parts.append(f"unknown {stats.unknown}")
+    if state.packet_rate > 0:
+        parts.append(_format_packets(state.packet_rate))
     countries = [code for code, _ in stats.countries.most_common(4) if code != "--"]
     if countries:
         parts.append(" ".join(countries))
@@ -1714,6 +1746,48 @@ def _start_anchor_search(
     return holder
 
 
+def _spawn_pulses(state: _State, bursts: list[Burst], now: float) -> None:
+    """Put the sparks of the packets on the map.
+
+    A burst is the traffic of one peer since the last poll.  The place
+    of the peer comes from the flows of the map: a peer that has no
+    flow has no place, and no spark.
+
+    Args:
+        state: What the interface knows.
+        bursts: The bursts of the packets.
+        now: The moment of the frame, in seconds.
+    """
+    if not bursts:
+        # The packets stopped: the rate is forgotten, so that a quiet
+        # machine does not show the rate of the last burst forever.
+        if state.packet_time is not None and now - state.packet_time > PACKET_RATE_TTL:
+            state.packet_rate = 0.0
+        return
+    places: dict[str, Flow] = {}
+    for flow in state.visible_flows:
+        places.setdefault(flow.remote.ip, flow)
+    packets = 0
+    for burst in bursts:
+        packets += burst.packets
+        flow = places.get(burst.remote)
+        if flow is None:
+            continue
+        # The spark is put at the moment its packets happened, not at
+        # the moment they were read: the age of the burst is taken
+        # away from the clock of the frame.
+        state.animator.spawn_pulse(flow.remote, now - burst.age, burst.bytes, flow.key)
+    previous = state.packet_time
+    state.packet_time = now
+    if previous is not None and now > previous:
+        instant = packets / (now - previous)
+        state.packet_rate = (
+            instant
+            if state.packet_rate == 0.0
+            else 0.7 * state.packet_rate + 0.3 * instant
+        )
+
+
 def _draw(
     stdscr: "curses.window",
     map_: _Map,
@@ -1757,6 +1831,7 @@ def _draw(
     state.read_error()
 
     batch: list[FlowEvent] = []
+    bursts: list[Burst] = []
     flows: list[Flow] | None = None
     stats: Stats | None = None
     while True:
@@ -1765,9 +1840,9 @@ def _draw(
         except queue.Empty:
             break
         batch.extend(sample.events)
+        bursts.extend(sample.bursts)
         flows = sample.flows
         stats = sample.stats
-        state.bursts = sample.bursts
 
     if flows is not None and stats is not None:
         # The flows of the table are the truth of the map: they are
@@ -1781,6 +1856,7 @@ def _draw(
             # flows the filter leaves out: their peers are kept, so
             # that they come back when the filter is removed.
             state.animator.handle_event(event, now)
+        _spawn_pulses(state, bursts, now)
     # The expired comets and peers are taken away at every frame, so
     # that they do not pile up.
     state.animator.prune(state.now)
@@ -1899,6 +1975,10 @@ def snapshot(cfg: Config, path: Path, frames: int) -> int:
             for event in events:
                 state.animator.handle_event(event, now)
             state.update(table.flows(), table.stats())
+            # The sparks of the packets are put on the frame as well:
+            # a demonstration of the packets is a demonstration of the
+            # sparks.
+            _spawn_pulses(state, _drain_bursts(collector), now)
         state.now = now
         state.animator.prune(state.now)
         frame = _render(map_, state, state.now, state.stats)
