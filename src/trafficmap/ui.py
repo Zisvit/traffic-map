@@ -357,6 +357,9 @@ class _State:
         self.hidden: set[str] = set()
         #: The thread that polls the sockets, when the map is live.
         self.collector: _CollectorThread | None = None
+        #: Whether the collector reads the sockets, and only them: the
+        #: status bar warns about the privileges only then.
+        self.sockets_only = False
         #: The message of the last failure of the collector.
         self.error: str | None = None
         #: The words that tell the user what is broken.
@@ -954,6 +957,17 @@ class _FallbackCollector:
         """The message that stays on the screen while the sockets are read."""
         return self._warning
 
+    @property
+    def sockets_only(self) -> bool:
+        """Whether the collector reads the sockets, and only them.
+
+        Returns:
+            ``True`` when the packets are not read: the sockets of the
+            machine are read instead, and without root they are only
+            the sockets of the user.
+        """
+        return self._switched
+
     def poll(self) -> list[SocketRow]:
         """Read the traffic of the machine.
 
@@ -989,6 +1003,13 @@ class _FallbackCollector:
         except Exception as exc:  # noqa: BLE001 - the map must survive
             log.debug("cannot read the bursts: %s", exc)
             return []
+
+    def close(self) -> None:
+        """Stop the collector that is read, and the one that is not."""
+        for collector in (self._primary, self._fallback):
+            close = getattr(collector, "close", None)
+            if close is not None:
+                close()
 
 
 def make_collector(cfg: Config) -> SsCollector | PcapCollector | MockCollector:
@@ -1370,7 +1391,11 @@ def _status_lines(
         # The collector is down: the banner comes first, it is the
         # most important thing the user has to know.
         parts.append((f"{state.error_label}: {state.error}", _C_WARNING))
-    if not _is_root():
+    sockets_without_root = state.sockets_only and not _is_root()
+    if sockets_without_root:
+        # Not root and the sockets are read: they show only the
+        # sockets of the user.  With root, or with the packets of the
+        # machine, this warning would be a lie.
         parts.append(("no root: only your sockets", _C_WARNING))
     parts.append((state.anchor_text, _C_DEFAULT))
     if map_.zoom > MIN_ZOOM:
@@ -1503,6 +1528,16 @@ class _CollectorThread(threading.Thread):
         packets, and ``"collector error"`` otherwise.
         """
         return getattr(self._collector, "error_label", "collector error")
+
+    @property
+    def sockets_only(self) -> bool:
+        """Whether the collector reads the sockets, and only them.
+
+        Returns:
+            ``True`` when the collector does not read the packets: what
+            it sees is the sockets of the machine.
+        """
+        return bool(getattr(self._collector, "sockets_only", False))
 
     def _set_error(self, message: str | None) -> None:
         """Remember the message of the last failure of the collector.
@@ -1846,6 +1881,7 @@ def _loop(
     table = FlowTable(resolver, poll_ms=cfg.poll_ms)
     collector_thread = _CollectorThread(collector, table, events, cfg.poll_ms, stop)
     state.collector = collector_thread
+    state.sockets_only = collector_thread.sockets_only
     collector_thread.start()
 
     anchor_holder: list[tuple[Geo | None, float | None]] = []
@@ -1888,6 +1924,7 @@ def _loop(
             continue
         running = _handle_key(key, state, map_)
     stop.set()
+    collector_thread.join(timeout=2.0)
     return 0
 
 
@@ -2079,6 +2116,10 @@ def run(cfg: Config) -> int:
     except curses.error as exc:
         print(f"tmap: the terminal cannot show the map: {exc}", file=sys.stderr)
         return 2
+    finally:
+        close = getattr(collector, "close", None)
+        if close is not None:
+            close()
 
 
 def snapshot(cfg: Config, path: Path, frames: int) -> int:
@@ -2118,6 +2159,7 @@ def snapshot(cfg: Config, path: Path, frames: int) -> int:
         return 2
 
     state = _State(cfg)
+    state.sockets_only = bool(getattr(collector, "sockets_only", False))
     map_ = _Map(cfg, SNAPSHOT_COLS, SNAPSHOT_ROWS)
     table = FlowTable(resolver, poll_ms=cfg.poll_ms)
     clock = _clock_of(collector)
@@ -2161,6 +2203,9 @@ def snapshot(cfg: Config, path: Path, frames: int) -> int:
         state.animator.prune(state.now)
         frame = _render(map_, state, state.now, state.stats)
 
+    close = getattr(collector, "close", None)
+    if close is not None:
+        close()
     if frame is None:  # pragma: no cover - the loop always runs once
         return 2
     try:

@@ -66,6 +66,11 @@ class MockCollector:
         OSError: If the recording cannot be read.
     """
 
+    #: The recording is neither the packets nor the sockets of the
+    #: machine: no privilege changes what it shows, and no warning of
+    #: the privileges belongs to it.
+    sockets_only = False
+
     def __init__(self, path: Path) -> None:
         self._path = Path(path)
         self._ticks = _read_ticks(self._path)

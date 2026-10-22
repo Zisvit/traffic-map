@@ -44,6 +44,7 @@ from trafficmap.ui import (
     _C_IN,
     _C_WARNING,
     _CollectorThread,
+    _FallbackCollector,
     _Map,
     _State,
     _colour_of,
@@ -788,6 +789,123 @@ def test_the_escape_key_takes_the_filter_away():
     assert "filter:" not in line
 
 
+# -- the banner of the privileges ----------------------------------------
+
+
+def _third_line_of_status(state: _State, map_: _Map) -> str:
+    """Return the last line of the status bar as plain text."""
+    return "".join(part for part, _ in _status_lines(map_, state, state.stats)[2])
+
+
+def test_the_banner_of_the_root_speaks_of_the_sockets(monkeypatch):
+    """Without root the sockets are only the sockets of the user."""
+    state = _State(Config())
+    map_ = make_map(ANCHOR, 1)
+    state.sockets_only = True
+    monkeypatch.setattr("trafficmap.ui._is_root", lambda: False)
+    assert "no root: only your sockets" in _third_line_of_status(state, map_)
+
+
+def test_the_banner_of_the_root_is_gone_with_the_packets(monkeypatch):
+    """Without root the packets are still every packet of the machine."""
+    state = _State(Config())
+    map_ = make_map(ANCHOR, 1)
+    state.sockets_only = False
+    monkeypatch.setattr("trafficmap.ui._is_root", lambda: False)
+    assert "no root" not in _third_line_of_status(state, map_)
+
+
+def test_the_banner_of_the_root_needs_the_sockets():
+    """A state that does not say what is read does not claim anything."""
+    state = _State(Config())
+    map_ = make_map(ANCHOR, 1)
+    assert "no root" not in _third_line_of_status(state, map_)
+
+
+# -- the fallback from the packets to the sockets ------------------------
+
+
+class _FakeCollector:
+    """A collector with a fixed answer, for the tests of the fallback."""
+
+    error_label = "collector error"
+    sockets_only = True
+
+    def __init__(self, rows=None, error=None):
+        self.rows = rows if rows is not None else []
+        self.error = error
+        self.calls = 0
+        self.closed = False
+
+    def poll(self):
+        """Return the fixed rows, or fail with the fixed error."""
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.rows
+
+    def drain_bursts(self):
+        """Return no bursts: the fake reads no packets."""
+        return []
+
+    def close(self):
+        """Remember that the collector was closed."""
+        self.closed = True
+
+
+def test_the_capture_that_cannot_start_reads_the_sockets():
+    """A capture that failed at the start leaves the sockets to the map."""
+    sockets = _FakeCollector()
+    fallback = _FallbackCollector(None, sockets, "no privileges")
+
+    assert fallback.error_label == "capture error"
+    assert fallback.sockets_only is True
+    assert fallback.warning == "no privileges"
+    assert fallback.poll() == []
+    assert sockets.calls == 1
+    assert fallback.drain_bursts() == []
+
+
+def test_the_capture_that_dies_switches_to_the_sockets():
+    """A capture that fails later does not stop the map either."""
+    packets = _FakeCollector(error=RuntimeError("Operation not permitted"))
+    packets.sockets_only = False
+    sockets = _FakeCollector()
+    fallback = _FallbackCollector(packets, sockets)
+    assert fallback.sockets_only is False
+
+    fallback.poll()
+    assert fallback.sockets_only is True
+    assert fallback.warning == "Operation not permitted (sockets only)"
+
+    fallback.poll()
+    assert packets.calls == 1
+    assert sockets.calls == 2
+
+
+def test_the_capture_that_works_keeps_the_packets():
+    """A capture that works never touches the sockets."""
+    packets = _FakeCollector()
+    packets.sockets_only = False
+    sockets = _FakeCollector()
+    fallback = _FallbackCollector(packets, sockets)
+
+    fallback.poll()
+
+    assert fallback.sockets_only is False
+    assert fallback.warning is None
+    assert sockets.calls == 0
+
+
+def test_the_fallback_closes_both_collectors():
+    """Both the capture and the sockets are given up together."""
+    packets = _FakeCollector()
+    sockets = _FakeCollector()
+    _FallbackCollector(packets, sockets).close()
+    assert packets.closed is True
+    assert sockets.closed is True
+
+
 # -- the sparks of the packets -----------------------------------------
 
 
@@ -795,9 +913,7 @@ def test_the_bursts_of_the_packets_become_sparks():
     state = _State(Config())
     flow = make_flow("1.1.1.1|100|tcp", "curl", LOCAL_PEER)
     state.update([flow], stats_of([flow]))
-    burst = Burst(
-        remote=LOCAL_PEER.ip, bytes=2048, packets=12, proto="tcp", age=0.25
-    )
+    burst = Burst(remote=LOCAL_PEER.ip, bytes=2048, packets=12, proto="tcp", age=0.25)
     _spawn_pulses(state, [burst], now=10.0)
     pulses = state.animator.pulses
     assert len(pulses) == 1
@@ -897,9 +1013,7 @@ def test_the_wheel_on_the_status_bar_zooms_the_middle():
     map_ = make_map(ANCHOR, 1)
     middle = (map_.canvas.width // 2, map_.canvas.height // 2)
     before = unproject(middle[0], middle[1], map_.viewport())
-    _zoom_with_mouse(
-        map_, (0, 5, map_.map_height + 1, 0, curses.BUTTON4_PRESSED)
-    )
+    _zoom_with_mouse(map_, (0, 5, map_.map_height + 1, 0, curses.BUTTON4_PRESSED))
     after = unproject(middle[0], middle[1], map_.viewport())
     assert map_.zoom == pytest.approx(ZOOM_STEP)
     assert after[0] == pytest.approx(before[0], abs=1e-6)

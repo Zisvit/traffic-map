@@ -483,6 +483,10 @@ class PcapCollector:
     #: The words that tell the user that the capture is broken.
     error_label = "capture error"
 
+    #: The collector reads every packet of the machine, not the
+    #: sockets of the user: privileges do not change what it sees.
+    sockets_only = False
+
     def __init__(
         self,
         interface: str = "",

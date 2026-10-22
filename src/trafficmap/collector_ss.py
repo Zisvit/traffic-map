@@ -174,6 +174,10 @@ class SsCollector:
         ValueError: If the command is empty.
     """
 
+    #: ``ss`` reads the sockets of the machine, and only them: without
+    #: root they are the sockets of the user.
+    sockets_only = True
+
     def __init__(
         self,
         command: list[str] | None = None,

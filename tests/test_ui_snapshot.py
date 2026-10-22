@@ -6,7 +6,6 @@ no terminal at all.
 """
 
 import logging
-import os
 import sys
 from pathlib import Path
 
@@ -34,12 +33,6 @@ EXPECTED_MAP_LINES = SNAPSHOT_ROWS - STATUS_ROWS
 #: The first and the last character of the Braille block.
 BRAILLE_FIRST = "⠀"
 BRAILLE_LAST = "⣿"
-
-
-def is_root() -> bool:
-    """Tell whether the tests run as root."""
-    geteuid = getattr(os, "geteuid", None)
-    return geteuid is not None and geteuid() == 0
 
 
 def snapshot_path(tmp_path: Path, name: str = "frame.txt") -> Path:
@@ -210,17 +203,8 @@ def test_the_ascii_snapshot_shows_the_same_status_bar(tmp_path):
     assert braille.splitlines()[-3:] == ascii_.splitlines()[-3:]
 
 
-@pytest.mark.skipif(is_root(), reason="the tests run as root")
-def test_the_banner_of_the_root_is_on_the_third_line(tmp_path):
-    """Without root the user is told that only his own sockets are seen."""
-    text = make_snapshot(tmp_path)
-    lines = text.splitlines()
-    assert "no root: only your sockets" in lines[-1]
-
-
-@pytest.mark.skipif(not is_root(), reason="the tests do not run as root")
-def test_there_is_no_banner_when_the_program_runs_as_root(tmp_path):
-    """With root the banner of the root is not shown."""
+def test_the_recording_does_not_warn_about_the_privileges(tmp_path):
+    """A recording is not the sockets of the user: no banner belongs to it."""
     text = make_snapshot(tmp_path)
     assert "no root" not in text
 
