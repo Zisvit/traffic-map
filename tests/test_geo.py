@@ -34,6 +34,16 @@ ASN_RECORD = {
     "autonomous_system_number": 15169,
     "autonomous_system_organization": "Google LLC",
 }
+#: A network that is not one of the anycast ones of the table.
+PLAIN_ASN_RECORD = {
+    "autonomous_system_number": 64500,
+    "autonomous_system_organization": "Example Network",
+}
+#: A network that answers from many cities at once.
+CLOUDFLARE_ASN = {
+    "autonomous_system_number": 13335,
+    "autonomous_system_organization": "Cloudflare, Inc.",
+}
 
 
 class FakeReader:
@@ -48,7 +58,7 @@ class FakeReader:
         return self.records.get(ip)
 
 
-def make_resolver(monkeypatch, tmp_path, city=None, asn=None):
+def make_resolver(monkeypatch, tmp_path, city=None, asn=None, scatter=False):
     """Build a resolver whose databases are stubs.
 
     Args:
@@ -56,6 +66,7 @@ def make_resolver(monkeypatch, tmp_path, city=None, asn=None):
         tmp_path: Directory of the anchor cache.
         city: Records of the city database.
         asn: Records of the ASN database.
+        scatter: Whether the addresses of one city are spread apart.
 
     Returns:
         The resolver, the city reader and the ASN reader.
@@ -69,7 +80,7 @@ def make_resolver(monkeypatch, tmp_path, city=None, asn=None):
         return city_reader if kind == "city" else asn_reader
 
     monkeypatch.setattr(geo, "_open_database", fake_open)
-    resolver = GeoResolver(CITY_DB, ASN_DB, tmp_path)
+    resolver = GeoResolver(CITY_DB, ASN_DB, tmp_path, scatter=scatter)
     return resolver, city_reader, asn_reader, opened
 
 
@@ -192,13 +203,57 @@ def test_lookup_of_an_unknown_address(resolver):
 
 def test_lookup_of_an_unknown_address_keeps_the_asn(monkeypatch, tmp_path):
     resolver, _, _, _ = make_resolver(
-        monkeypatch, tmp_path, city={}, asn={"203.0.113.7": ASN_RECORD}
+        monkeypatch, tmp_path, city={}, asn={"203.0.113.7": PLAIN_ASN_RECORD}
     )
     geo_ = resolver.lookup("203.0.113.7")
     assert geo_.country == "--"
     assert geo_.lat is None
-    assert geo_.asn == 15169
-    assert geo_.org == "Google LLC"
+    assert geo_.asn == 64500
+    assert geo_.org == "Example Network"
+
+
+def test_an_anycast_address_takes_the_place_of_its_network(monkeypatch, tmp_path):
+    """The address of a CDN is answered from the point of presence near home."""
+    resolver, _, _, _ = make_resolver(
+        monkeypatch, tmp_path, city={}, asn={"203.0.113.7": CLOUDFLARE_ASN}
+    )
+    resolver.set_home(55.75, 37.62)
+
+    geo_ = resolver.lookup("203.0.113.7")
+
+    assert geo_.country == "RU"
+    assert geo_.city == "Moscow"
+    assert (geo_.lat, geo_.lon) == (55.7558, 37.6173)
+    assert geo_.asn == 13335
+    assert geo_.org == "Cloudflare, Inc."
+
+
+def test_an_anycast_address_without_a_home_takes_the_main_place(monkeypatch, tmp_path):
+    """A resolver that knows no home falls back to the main place."""
+    resolver, _, _, _ = make_resolver(
+        monkeypatch, tmp_path, city={}, asn={"203.0.113.7": CLOUDFLARE_ASN}
+    )
+
+    geo_ = resolver.lookup("203.0.113.7")
+
+    assert geo_.city == "Amsterdam"
+    assert geo_.country == "NL"
+
+
+def test_the_anchor_is_not_moved_to_a_point_of_presence(monkeypatch, tmp_path):
+    """This machine is where the database says, not where its network is."""
+    resolver, _, _, _ = make_resolver(
+        monkeypatch,
+        tmp_path,
+        city={"203.0.113.9": CITY_RECORD},
+        asn={"203.0.113.9": CLOUDFLARE_ASN},
+    )
+    monkeypatch.setattr(geo, "_fetch_public_ip", lambda *args, **kwargs: "203.0.113.9")
+
+    anchor = resolver.anchor()
+
+    assert anchor.city == "Mountain View"
+    assert (anchor.lat, anchor.lon) == (37.422, -122.085)
 
 
 def test_lookup_of_a_local_address_skips_the_database(resolver):
@@ -478,6 +533,83 @@ def test_real_database_asn_lookup():
     geo_ = resolver.lookup("8.8.8.8")
     assert geo_.asn == 15169
     assert geo_.org == "Google LLC"
+
+
+# -- the spread of the addresses of one city ----------------------------
+
+
+def test_the_spread_is_off_by_default(monkeypatch, tmp_path):
+    """The place of the database is the truth unless the spread is asked for."""
+    resolver, _, _, _ = make_resolver(
+        monkeypatch,
+        tmp_path,
+        city={"203.0.113.7": CITY_RECORD},
+        asn={"203.0.113.7": PLAIN_ASN_RECORD},
+    )
+    geo_ = resolver.lookup("203.0.113.7")
+    assert (geo_.lat, geo_.lon) == (37.422, -122.085)
+
+
+def test_two_addresses_of_one_city_are_spread_apart(monkeypatch, tmp_path):
+    """Two addresses of one city get two dots, both in the city."""
+    resolver, _, _, _ = make_resolver(
+        monkeypatch,
+        tmp_path,
+        city={"8.8.8.8": CITY_RECORD, "8.8.4.4": CITY_RECORD},
+        asn={"8.8.8.8": PLAIN_ASN_RECORD, "8.8.4.4": PLAIN_ASN_RECORD},
+        scatter=True,
+    )
+
+    first = resolver.lookup("8.8.8.8")
+    second = resolver.lookup("8.8.4.4")
+
+    assert (first.lat, first.lon) != (second.lat, second.lon)
+    for geo_ in (first, second):
+        assert geo_.city == "Mountain View"
+        assert abs(geo_.lat - 37.422) <= geo.SCATTER_DEGREES
+        assert abs(geo_.lon + 122.085) <= geo.SCATTER_DEGREES
+
+
+def test_the_spread_of_an_address_never_changes(monkeypatch, tmp_path):
+    """The same address lands on the same spot in every resolver."""
+    first, _, _, _ = make_resolver(
+        monkeypatch, tmp_path, city={"8.8.8.8": CITY_RECORD}, scatter=True
+    )
+    second, _, _, _ = make_resolver(
+        monkeypatch, tmp_path, city={"8.8.8.8": CITY_RECORD}, scatter=True
+    )
+
+    one = first.lookup("8.8.8.8")
+    other = second.lookup("8.8.8.8")
+
+    assert (one.lat, one.lon) == (other.lat, other.lon)
+    assert (one.lat, one.lon) != (37.422, -122.085)
+
+
+def test_the_spread_leaves_an_unknown_place_alone(monkeypatch, tmp_path):
+    """An address without a place has nothing to spread."""
+    resolver, _, _, _ = make_resolver(monkeypatch, tmp_path, scatter=True)
+    geo_ = resolver.lookup("203.0.113.7")
+    assert geo_.lat is None
+    assert geo_.lon is None
+    assert geo_.country == "--"
+
+
+def test_the_spread_is_the_size_of_a_city():
+    assert 0.0 < geo.SCATTER_DEGREES <= 0.5
+
+
+def test_the_home_can_be_set_after_the_resolver_is_built(monkeypatch, tmp_path):
+    """A home that arrives later chooses the point of presence of a lookup."""
+    resolver, _, _, _ = make_resolver(
+        monkeypatch, tmp_path, city={}, asn={"203.0.113.7": CLOUDFLARE_ASN}
+    )
+    resolver.set_home(52.52, 13.40)
+
+    geo_ = resolver.lookup("203.0.113.7")
+
+    assert geo_.city == "Frankfurt"
+    assert geo_.country == "DE"
 
 
 def public_ip(number):

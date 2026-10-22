@@ -1613,12 +1613,18 @@ def _resolve_anchor(
             asn=None,
             org=None,
         )
+        resolver.set_home(lat, lon)
         return geo, None
     start = time.monotonic()
     geo = resolver.anchor()
     elapsed = (time.monotonic() - start) * 1000.0
     if geo is None:
         return None, None
+    if geo.lat is not None and geo.lon is not None:
+        # The network of an address answers from the point of presence
+        # closest to this machine: the resolver needs to know where the
+        # machine is.
+        resolver.set_home(geo.lat, geo.lon)
     return geo, elapsed
 
 
@@ -2046,7 +2052,9 @@ def run(cfg: Config) -> int:
         print("TUI requires a terminal", file=sys.stderr)
         return 2
     try:
-        resolver = GeoResolver(cfg.city_db, cfg.asn_db, cfg.cache_dir)
+        resolver = GeoResolver(
+            cfg.city_db, cfg.asn_db, cfg.cache_dir, scatter=True
+        )
     except FileNotFoundError as exc:
         print(f"tmap: {exc}", file=sys.stderr)
         print("tmap: run 'make assets' to download the databases", file=sys.stderr)
@@ -2089,7 +2097,9 @@ def snapshot(cfg: Config, path: Path, frames: int) -> int:
         ``0`` when the frame was written, ``2`` when it cannot be.
     """
     try:
-        resolver = GeoResolver(cfg.city_db, cfg.asn_db, cfg.cache_dir)
+        resolver = GeoResolver(
+            cfg.city_db, cfg.asn_db, cfg.cache_dir, scatter=True
+        )
     except FileNotFoundError as exc:
         print(f"tmap: {exc}", file=sys.stderr)
         print("tmap: run 'make assets' to download the databases", file=sys.stderr)

@@ -26,6 +26,23 @@ vendor.  The field names of GeoLite2 (``location.latitude``,
 same, so a swapped-in GeoLite2 file keeps working.  A field that is
 missing simply leaves its value empty.
 
+The place of a network
+----------------------
+An address of a content network is answered from one of its points of
+presence, and the database puts all of them on the place of one
+office.  :mod:`trafficmap.asn_coords` holds a short table of those
+networks: their addresses get the place of the point of presence
+closest to this machine, and the place of the machine is given to the
+resolver with :meth:`GeoResolver.set_home`.
+
+The spread
+----------
+A city is one place in the databases, and every address of the city is
+the same dot.  A resolver built with ``scatter=True`` moves every
+address a little around its city, by less than :data:`SCATTER_DEGREES`,
+with an offset that only depends on the address: the map shows the
+addresses apart, and nothing moves between two frames.
+
 The cache
 ---------
 The place of an address is kept in memory.  A lock guards the cache:
@@ -47,6 +64,7 @@ anchor is a convenience, and the map works without it.
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import ipaddress
 import json
@@ -59,11 +77,13 @@ import time
 import urllib.error
 import urllib.request
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
 import maxminddb
+
+from trafficmap.asn_coords import anycast_place
 
 __all__ = ["Geo", "GeoResolver", "is_local"]
 
@@ -113,6 +133,11 @@ LON_RANGE = (-180.0, 180.0)
 
 #: Maximum number of addresses kept in the in-memory cache.
 CACHE_LIMIT = 4096
+
+#: Radius of the spread of the addresses of one city, in degrees.  It
+#: is the size of a city, not the accuracy of the database: a dot a few
+#: kilometres away from the place of the city is the same city.
+SCATTER_DEGREES = 0.15
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +224,36 @@ def _normalize(ip: str) -> str:
     return text
 
 
+def _spread(geo: Geo, ip: str) -> Geo:
+    """Move the place of an address a little, around its own city.
+
+    The database gives one place to a city, so every address of the
+    city is the same dot and the map does not show how many addresses
+    there are.  The offset of an address is taken from its own text, so
+    it never moves between two frames, and it is of the size of a city:
+    it is a way of drawing the addresses, not a claim of accuracy.
+
+    Args:
+        geo: The place of the address.
+        ip: The address.
+
+    Returns:
+        The place, moved by less than :data:`SCATTER_DEGREES`.  A place
+        without coordinates is kept as it is.
+    """
+    if geo.lat is None or geo.lon is None:
+        return geo
+    digest = hashlib.sha1(ip.encode("utf-8")).digest()
+    # Two numbers in [-1, 1), one for each axis.
+    offset_lat = int.from_bytes(digest[:4], "big") / 2**31 - 1.0
+    offset_lon = int.from_bytes(digest[4:8], "big") / 2**31 - 1.0
+    lat = min(90.0, max(-90.0, geo.lat + offset_lat * SCATTER_DEGREES))
+    lon = geo.lon + offset_lon * SCATTER_DEGREES
+    if lon < -180.0 or lon >= 180.0:
+        lon = (lon + 180.0) % 360.0 - 180.0
+    return replace(geo, lat=lat, lon=lon)
+
+
 class GeoResolver:
     """Resolve addresses to places, and find the anchor of the machine.
 
@@ -208,6 +263,14 @@ class GeoResolver:
             skipped when the file does not exist.
         cache_dir: Directory of the anchor cache file.  Without it the
             anchor is resolved on every call and never cached.
+        scatter: Whether the addresses of one city are spread apart
+            around the place of the city.  The database gives one place
+            to a city, and every flow of the city would be the same
+            dot: the map would say nothing about how many of them there
+            are.  The spread is deterministic, the same address always
+            lands on the same spot, and it is the size of a city.  It
+            is off by default, because the place of the database is the
+            truth and the spread is a way of drawing it.
 
     Raises:
         FileNotFoundError: If the city database does not exist.
@@ -219,6 +282,7 @@ class GeoResolver:
         city_db: Path,
         asn_db: Path | None = None,
         cache_dir: Path | None = None,
+        scatter: bool = False,
     ) -> None:
         self._city: maxminddb.Reader = _open_database(Path(city_db), "city")
         self._asn: maxminddb.Reader | None = None
@@ -229,6 +293,24 @@ class GeoResolver:
         self._cache_dir = Path(cache_dir) if cache_dir is not None else None
         self._cache: OrderedDict[str, Geo] = OrderedDict()
         self._cache_lock = threading.Lock()
+        self._scatter = scatter
+        self._home: tuple[float, float] | None = None
+        self._anchor_ip: str | None = None
+
+    def set_home(self, lat: float, lon: float) -> None:
+        """Tell the resolver where this machine is.
+
+        The place of the machine is what chooses the point of presence
+        of a network that answers from many cities: the traffic of this
+        machine goes to the closest one.  A resolver that knows no home
+        uses the main point of presence of the network, which can be on
+        another continent.
+
+        Args:
+            lat: Latitude of the machine, in degrees.
+            lon: Longitude of the machine, in degrees.
+        """
+        self._home = (lat, lon)
 
     def lookup(self, ip: str) -> Geo:
         """Resolve one address to its place.
@@ -255,6 +337,8 @@ class GeoResolver:
             # The databases are read without the lock, a lookup of a
             # single address must not hold up the other threads.
             geo = self._lookup_public(key)
+            if self._scatter and key != self._anchor_ip:
+                geo = _spread(geo, key)
 
         self._cache_put(key, geo)
         return geo
@@ -305,6 +389,9 @@ class GeoResolver:
             log.debug("cannot resolve the public address")
             return None
 
+        # The address of this machine has no point of presence to
+        # choose: it is where it is.
+        self._anchor_ip = _normalize(ip)
         geo = self.lookup(ip)
         self._write_anchor_cache(geo)
         return geo
@@ -342,6 +429,17 @@ class GeoResolver:
                 city = _english_name(city_record)
 
         asn, org = self._lookup_asn(ip)
+        # An address of a network that answers from many cities is not
+        # where the database says: the place of the point of presence
+        # closest to this machine is the best guess of where it is.
+        # The address of this machine is never one of those: its own
+        # place is the truth of the database.
+        place = None if ip == self._anchor_ip else anycast_place(asn, self._home)
+        if place is not None:
+            lat, lon = place.lat, place.lon
+            country = place.country
+            city = place.city
+            country_name = None
         log.debug("%s: %s, %s, asn %s", ip, country_name or country, city or "-", asn)
         return Geo(ip, lat, lon, country, city, asn, org)
 
