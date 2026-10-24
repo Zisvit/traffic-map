@@ -14,6 +14,11 @@ a person with ``grep``.  A closed flow has nothing to show but its key::
 
     {"t": 13.0, "type": "closed", "key": "1.1.1.1|100|tcp"}
 
+A flow of the packets is born before the process of its socket is
+known: its first record has no pid.  When the process appears, the dump
+closes the old key and opens the new one, so that every key of the file
+is opened and closed once.
+
 The dump never touches the terminal: it is a plain file, and the
 program that writes it can run in a window, in a container or in a
 service.
@@ -36,7 +41,7 @@ from trafficmap.collector_mock import MockCollector
 from trafficmap.collector_pcap import PcapCollector
 from trafficmap.collector_ss import SocketRow, SsCollector
 from trafficmap.config import Config
-from trafficmap.flows import Closed, FlowEvent, FlowTable, Opened
+from trafficmap.flows import Closed, FlowEvent, FlowTable, Opened, Renamed, Updated
 from trafficmap.geo import GeoResolver
 
 __all__ = ["dump_events", "run_dump"]
@@ -53,9 +58,32 @@ def dump_events(events: list[FlowEvent], now: float, out: TextIO) -> None:
         out: The file the lines are written to.
     """
     for event in events:
-        record = _record(event, now)
-        out.write(json.dumps(record, ensure_ascii=False))
-        out.write("\n")
+        for record in _records(event, now):
+            out.write(json.dumps(record, ensure_ascii=False))
+            out.write("\n")
+
+
+def _records(event: FlowEvent, now: float) -> list[dict[str, Any]]:
+    """Return the objects that describe one event.
+
+    A renamed flow is written as the closing of its old key and the
+    opening of its new one: the process of a flow of the packets is
+    known only after its first packet, and every key of the dump must
+    be closed once.
+
+    Args:
+        event: The event of the poll.
+        now: The moment of the poll, in seconds.
+
+    Returns:
+        The objects that are written to the dump.
+    """
+    if isinstance(event, Renamed):
+        return [
+            {"t": now, "type": "closed", "key": event.key},
+            _record(Opened(flow=event.flow), now),
+        ]
+    return [_record(event, now)]
 
 
 def run_dump(
@@ -166,7 +194,7 @@ def _stop_the_dump(signum: int, frame: object) -> None:
     raise KeyboardInterrupt
 
 
-def _record(event: FlowEvent, now: float) -> dict[str, Any]:
+def _record(event: Opened | Updated | Closed, now: float) -> dict[str, Any]:
     """Build the object that describes one event.
 
     Args:

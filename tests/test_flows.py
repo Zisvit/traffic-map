@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from trafficmap.collector_ss import SocketRow
-from trafficmap.flows import Closed, FlowTable, Opened, Updated
+from trafficmap.flows import Closed, FlowTable, Opened, Renamed, Updated
 from trafficmap.geo import Geo, GeoResolver
 
 #: The places the stub resolver knows.
@@ -96,6 +96,51 @@ def row(
     )
 
 
+def capture_row(
+    remote_ip="1.1.1.1",
+    port=443,
+    proto="tcp",
+    pid=None,
+    process=None,
+    local_port=51000,
+    sent=None,
+    received=None,
+    state="ESTAB",
+):
+    """Build a socket of a poll of the packets.
+
+    The packets do not know the process of a socket when its first
+    packet arrives, so the key of the socket is its five-tuple: it
+    never holds the pid.
+
+    Args:
+        remote_ip: The address of the other side.
+        port: The port of the other side.
+        proto: The protocol of the socket.
+        pid: The number of the process, when it is known.
+        process: The name of that process, when it is known.
+        local_port: The port of this side, which makes the socket
+            unique.
+        sent: The bytes the socket has sent.
+        received: The bytes the socket has received.
+        state: The state of the socket.
+
+    Returns:
+        The socket.
+    """
+    return SocketRow(
+        proto=proto,
+        local=("10.0.0.2", local_port),
+        remote=(remote_ip, port),
+        state=state,
+        pid=pid,
+        process=process,
+        bytes_sent=sent,
+        bytes_received=received,
+        key=f"{proto}|10.0.0.2:{local_port}|{remote_ip}:{port}",
+    )
+
+
 def _socket_keys(table, key):
     """Return the keys of the sockets the table keeps for a flow.
 
@@ -136,6 +181,90 @@ def test_the_second_poll_reports_the_growth(resolver):
     assert updated.flow.tx_rate == pytest.approx(2000)
     assert updated.flow.rx_rate == pytest.approx(1000)
     assert updated.flow.tx == 3000 and updated.flow.rx == 1500
+
+
+def test_a_flow_without_a_process_is_renamed_when_the_process_is_known(resolver):
+    table = FlowTable(resolver, poll_ms=1000)
+    first = table.update([capture_row(sent=1000, received=500)], now=0.0)
+    opened = first[0]
+    assert isinstance(opened, Opened)
+    assert opened.flow.key == "1.1.1.1|None|tcp"
+
+    events = table.update(
+        [capture_row(pid=100, process="curl", sent=3000, received=700)],
+        now=1.0,
+    )
+    # The flow is the same flow: it is not closed and opened again.
+    assert not any(isinstance(event, (Opened, Closed)) for event in events)
+    renamed = next(event for event in events if isinstance(event, Renamed))
+    assert renamed.key == "1.1.1.1|None|tcp"
+    assert renamed.flow.key == "1.1.1.1|100|tcp"
+    assert (renamed.flow.pid, renamed.flow.process) == (100, "curl")
+    updated = next(event for event in events if isinstance(event, Updated))
+    # The delta of the poll that learned the process is not lost.
+    assert (updated.dtx, updated.drx) == (2000, 200)
+    assert updated.flow.tx_rate == pytest.approx(2000)
+    assert [flow.key for flow in table.flows()] == ["1.1.1.1|100|tcp"]
+    assert table.flows()[0].tx == 3000
+
+
+def test_the_flow_of_a_process_absorbs_the_flow_that_waited_for_it(resolver):
+    table = FlowTable(resolver, poll_ms=1000)
+    table.update(
+        [
+            capture_row(pid=100, process="curl", local_port=51000, sent=1000),
+            capture_row(pid=None, local_port=51001, sent=2000),
+        ],
+        now=0.0,
+    )
+    events = table.update(
+        [
+            capture_row(pid=100, process="curl", local_port=51000, sent=3000),
+            capture_row(pid=100, process="curl", local_port=51001, sent=4000),
+        ],
+        now=1.0,
+    )
+    closed = [event for event in events if isinstance(event, Closed)]
+    assert [event.key for event in closed] == ["1.1.1.1|None|tcp"]
+    assert not any(isinstance(event, (Opened, Renamed)) for event in events)
+    # Both sockets count in the flow of the process now.
+    flows = table.flows()
+    assert len(flows) == 1
+    assert flows[0].key == "1.1.1.1|100|tcp"
+    assert flows[0].tx == 7000
+    updated = next(event for event in events if isinstance(event, Updated))
+    assert (updated.dtx, updated.drx) == (4000, 0)
+
+
+def test_a_hidden_flow_is_not_renamed(resolver):
+    """A key that the dump closed must not be closed a second time."""
+    table = FlowTable(resolver, poll_ms=1000)
+    table.update([capture_row(sent=1000)], now=0.0)
+    # The flow goes out of sight: its old key is closed.
+    table.update([capture_row(sent=1000)], now=6.0)
+    events = table.update([capture_row(pid=100, process="curl", sent=2000)], now=7.0)
+    assert not any(isinstance(event, Renamed) for event in events)
+    # The flow of the process is a new flow; the old one stays in the
+    # table until it is removed.
+    assert [type(event) for event in events] == [Opened]
+    assert [flow.key for flow in table.flows()] == ["1.1.1.1|100|tcp"]
+
+
+def test_a_new_connection_does_not_adopt_a_flow_that_waited(resolver):
+    """A pid adopts the flow of its own socket only."""
+    table = FlowTable(resolver, poll_ms=1000)
+    table.update([capture_row(local_port=51000, sent=1000)], now=0.0)
+    table.update([capture_row(local_port=51000, sent=2000)], now=1.0)
+    events = table.update(
+        [
+            capture_row(local_port=51000, sent=3000),
+            capture_row(pid=100, process="curl", local_port=51001, sent=500),
+        ],
+        now=2.0,
+    )
+    assert not any(isinstance(event, Renamed) for event in events)
+    keys = {flow.key for flow in table.flows()}
+    assert keys == {"1.1.1.1|None|tcp", "1.1.1.1|100|tcp"}
 
 
 def test_a_new_socket_carries_no_delta(resolver):

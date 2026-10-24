@@ -40,6 +40,12 @@ The map must not become a fireworks show.  A comet is spawned:
   rate exceeds :data:`MIN_SPAWN_RATE`, but not more than one comet
   per flow every :data:`SPAWN_COOLDOWN` seconds.
 
+A flow of the packets is renamed when the process of its socket becomes
+known (:class:`trafficmap.flows.Renamed`): its peer keeps its life and
+its place, and the keys of its comets and of its sparks follow the new
+key, so that the filter of the process hides them all the same.  A
+rename spawns no comet: the flow has not carried anything new.
+
 The rate that counts is the rate of the flow itself, in bytes per
 second: the deltas of an update are bytes, not a rate, and the
 animator knows nothing about the length of a poll.
@@ -71,7 +77,7 @@ one is pushed out when the limit is reached.
 from __future__ import annotations
 
 from trafficmap.braille import Canvas
-from trafficmap.flows import Closed, Flow, FlowEvent, Opened, Updated
+from trafficmap.flows import Closed, Flow, FlowEvent, Opened, Renamed, Updated
 from trafficmap.geo import Geo
 from trafficmap.projection import Viewport, great_circle, project
 
@@ -511,7 +517,8 @@ class Animator:
 
         Args:
             event: The event: an :class:`trafficmap.flows.Opened`, an
-                :class:`trafficmap.flows.Updated` or a
+                :class:`trafficmap.flows.Updated`, a
+                :class:`trafficmap.flows.Renamed` or a
                 :class:`trafficmap.flows.Closed`.
             now: The moment of the event, in seconds.
         """
@@ -521,8 +528,38 @@ class Animator:
         elif isinstance(event, Updated):
             self._touch_peer(event.flow, now)
             self._spawn_for_update(event, now)
+        elif isinstance(event, Renamed):
+            self._rename(event.key, event.flow.key)
         elif isinstance(event, Closed):
             self._peers.pop(event.key, None)
+
+    def _rename(self, old_key: str, new_key: str) -> None:
+        """Move the peer and the sparks of a flow to its new key.
+
+        The flow of the packets is born without a process, and the
+        process is known later: the peer must not start its life again,
+        and the comets and the sparks that are in flight must follow
+        the filter of the flow.
+
+        Args:
+            old_key: The key the flow had.
+            new_key: The key the flow has now.
+        """
+        peer = self._peers.pop(old_key, None)
+        if peer is not None:
+            self._peers[new_key] = peer
+        last_spawn = self._last_spawn.pop(old_key, None)
+        if last_spawn is not None:
+            self._last_spawn[new_key] = last_spawn
+        if old_key in self._hidden:
+            self._hidden.discard(old_key)
+            self._hidden.add(new_key)
+        for comet in self._comets:
+            if comet.flow_key == old_key:
+                comet.flow_key = new_key
+        for pulse in self._pulses:
+            if pulse.flow_key == old_key:
+                pulse.flow_key = new_key
 
     def spawn(
         self,

@@ -371,7 +371,32 @@ def test_the_process_of_the_port_is_taken(pcap_file):
         rows = collector.poll()
         flow = next(row for row in rows if row.remote == ("1.1.1.1", 443))
         assert (flow.pid, flow.process) == (1234, "curl")
-        assert flow.key.endswith("|1234")
+        # The key of a socket is its five-tuple: it must not change
+        # when the process of the socket is known.
+        assert flow.key == f"tcp|{LOCAL}:51000|1.1.1.1:443"
+    finally:
+        collector.close()
+
+
+@needs_tshark
+def test_the_key_of_a_socket_survives_the_process_becoming_known(pcap_file):
+    answers = [{}, {51000: (1234, "curl")}]
+
+    def lookup() -> dict[int, tuple[int | None, str | None]]:
+        return answers.pop(0) if answers else {}
+
+    collector = PcapCollector(
+        pcap_file=pcap_file, addresses=ADDRESSES, process_lookup=lookup
+    )
+    try:
+        first = next(row for row in collector.poll() if row.remote == ("1.1.1.1", 443))
+        assert first.pid is None
+        assert first.key == f"tcp|{LOCAL}:51000|1.1.1.1:443"
+
+        second = next(row for row in collector.poll() if row.remote == ("1.1.1.1", 443))
+        assert (second.pid, second.process) == (1234, "curl")
+        assert second.key == first.key
+        assert second.bytes_sent == first.bytes_sent
     finally:
         collector.close()
 

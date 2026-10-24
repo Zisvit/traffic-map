@@ -753,10 +753,10 @@ class PcapCollector:
         """Return the rows of the five-tuples that are alive.
 
         Returns:
-            One row per five-tuple.  The key of a row holds the number
-            of the process, and it never changes: the table of the
-            flows reads the difference of the counters of the same
-            key.
+            One row per five-tuple.  The key of a row is the five-tuple
+            itself: the process of a socket is not known when its first
+            packet arrives, and the key of the row must not change when
+            it becomes known.
         """
         ports = self._lookup()
         rows: list[SocketRow] = []
@@ -782,7 +782,7 @@ class PcapCollector:
                     bytes_received=flow.received,
                     key=(
                         f"{flow.proto}|{flow.local[0]}:{flow.local[1]}|"
-                        f"{flow.remote[0]}:{flow.remote[1]}|{flow.pid}"
+                        f"{flow.remote[0]}:{flow.remote[1]}"
                     ),
                 )
             )

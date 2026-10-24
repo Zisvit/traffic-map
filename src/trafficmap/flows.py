@@ -34,6 +34,14 @@ the socket that carries the most bytes.  It follows the sockets of the
 flow, so the list of the busiest flows and the interface name a flow
 the same way.
 
+A flow of the packets is born before ``ss`` knows the process of its
+socket: the first packet of a connection is read before the kernel
+shows the socket.  Such a flow has ``None`` in the place of the pid in
+its key.  When the process appears, the flow is *renamed* in place:
+its sockets, counters and rates stay, only the key and the name of the
+process change.  A :class:`Renamed` event tells the interface; the flow
+is not closed and opened again, and the next poll still gets its delta.
+
 Local addresses
 ---------------
 A private, loopback or link-local address has no place on the map.
@@ -87,6 +95,7 @@ __all__ = [
     "FlowEvent",
     "FlowTable",
     "Opened",
+    "Renamed",
     "Stats",
     "Updated",
 ]
@@ -169,6 +178,25 @@ class Updated:
 
 
 @dataclass(frozen=True, slots=True)
+class Renamed:
+    """The flow is known under another key now.
+
+    A flow of the packets appears before the process of its socket is
+    known: its key has ``None`` in the place of the pid.  When the
+    process appears, the flow keeps its sockets, its counters and its
+    rates: only its key and its process change.  The flow is not
+    closed and opened again.
+
+    Attributes:
+        key: The key the flow had before the rename.
+        flow: The flow after the rename.
+    """
+
+    key: str
+    flow: Flow
+
+
+@dataclass(frozen=True, slots=True)
 class Closed:
     """The flow is gone.
 
@@ -180,7 +208,7 @@ class Closed:
 
 
 #: What the table tells about the flows after a poll.
-FlowEvent = Opened | Updated | Closed
+FlowEvent = Opened | Updated | Renamed | Closed
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,24 +410,21 @@ class FlowTable:
                 unknown=len(self._unknown_peers),
             )
 
-    def _update(self, rows: list[SocketRow], now: float) -> list[FlowEvent]:
-        """Do the work of a poll, with the lock held.
+    def _resolve(self, rows: list[SocketRow]) -> list[tuple[Geo, SocketRow]]:
+        """Return the sockets of the poll that have a place on the map.
+
+        The local peers and the peers the database does not know are
+        counted, and they are left out of the result.
 
         Args:
             rows: The sockets of the poll.
-            now: The moment of the poll, in seconds.
 
         Returns:
-            The events of the poll.
+            The sockets and the place of their remote address.
         """
-        elapsed = self._elapsed(now)
         local: set[str] = set()
         unknown: set[str] = set()
-        opened: list[str] = []
-        seen: dict[str, None] = {}
-        socket_keys: dict[str, set[str]] = {}
-        deltas: dict[str, tuple[int, int]] = {}
-
+        resolved: list[tuple[Geo, SocketRow]] = []
         for row in rows:
             host = row.remote[0]
             if is_local(host):
@@ -412,12 +437,54 @@ class FlowTable:
                 # point to draw a point that is not known.
                 unknown.add(host)
                 continue
+            resolved.append((geo, row))
+        self._local_peers = local
+        self._unknown_peers = unknown
+        return resolved
 
+    def _update(self, rows: list[SocketRow], now: float) -> list[FlowEvent]:
+        """Do the work of a poll, with the lock held.
+
+        Args:
+            rows: The sockets of the poll.
+            now: The moment of the poll, in seconds.
+
+        Returns:
+            The events of the poll.
+        """
+        elapsed = self._elapsed(now)
+        resolved = self._resolve(rows)
+        renamed, merged = self._adopt(resolved)
+
+        opened: list[str] = []
+        seen: dict[str, None] = {}
+        socket_keys: dict[str, set[str]] = {}
+        deltas: dict[str, tuple[int, int]] = {}
+
+        # The socket of a packet may be counted in a flow whose key
+        # already holds a pid: a row without a pid finds its flow by the
+        # socket, not by the key the pid would give it.
+        owners: dict[str, _FlowState] = {
+            socket_key: state
+            for state in self._flows.values()
+            for socket_key in state.sockets
+        }
+
+        for geo, row in resolved:
             # The key holds the address as the resolver knows it, so
             # that an IPv4-mapped address and the address it hides are
             # one flow.
             key = f"{geo.ip}|{row.pid}|{row.proto}"
-            state = self._flows.get(key)
+            state: _FlowState | None = None
+            if row.pid is None:
+                # A socket that is already counted keeps the flow it
+                # is in when the process of another socket of that flow
+                # is known: the flow must not split in two.
+                state = owners.get(row.key)
+                if state is not None:
+                    key = state.key
+            if state is None:
+                state = self._flows.get(key)
             if state is None:
                 state = _FlowState(
                     key=key,
@@ -451,9 +518,6 @@ class FlowTable:
                 old_tx, old_rx = deltas.get(key, (0, 0))
                 deltas[key] = (old_tx + dtx, old_rx + drx)
 
-        self._local_peers = local
-        self._unknown_peers = unknown
-
         # The sockets that are gone do not count any more.
         self._prune(socket_keys)
 
@@ -478,6 +542,10 @@ class FlowTable:
                 woken.append(key)
 
         events: list[FlowEvent] = []
+        for old_key, new_key in renamed:
+            events.append(Renamed(key=old_key, flow=_snapshot(self._flows[new_key])))
+        for old_key in merged:
+            events.append(Closed(key=old_key))
         for key in opened:
             events.append(Opened(flow=_snapshot(self._flows[key])))
         for key in woken:
@@ -492,6 +560,64 @@ class FlowTable:
         events.extend(self._hide(now))
         events.extend(self._close(now))
         return events
+
+    def _adopt(
+        self, resolved: list[tuple[Geo, SocketRow]]
+    ) -> tuple[list[tuple[str, str]], list[str]]:
+        """Give the flows that were born without a process their key.
+
+        A flow of the packets is born before ``ss`` knows the process of
+        its socket: its key has ``None`` in the place of the pid.  When
+        a socket of the flow shows its process, the flow is renamed in
+        the table, or its sockets join the flow of that process when it
+        already exists.  The sockets, the counters and the rates are
+        kept: the flow is not closed and opened again.
+
+        A flow that is out of sight is not touched: the dump closed its
+        old key when it went out of sight, and a rename would close it
+        twice.
+
+        Args:
+            resolved: The sockets of the poll and the places of their
+                remote addresses.
+
+        Returns:
+            The renames, ``(old_key, new_key)`` pairs, and the keys of
+            the flows that were merged into another flow.
+        """
+        renamed: list[tuple[str, str]] = []
+        merged: list[str] = []
+        for geo, row in resolved:
+            if row.pid is None:
+                continue
+            old_key = f"{geo.ip}|None|{row.proto}"
+            state = self._flows.get(old_key)
+            if state is None or not state.visible:
+                continue
+            # The pid belongs to a socket that is already counted: a
+            # five-tuple of another connection must not adopt the flow.
+            if row.key not in state.sockets:
+                continue
+            new_key = f"{geo.ip}|{row.pid}|{row.proto}"
+            existing = self._flows.get(new_key)
+            if existing is None:
+                del self._flows[old_key]
+                state.key = new_key
+                state.pid = row.pid
+                state.process = row.process or state.process
+                self._flows[new_key] = state
+                renamed.append((old_key, new_key))
+            else:
+                # The flow of the process was opened while the flow
+                # without a process was waiting for it: the sockets
+                # join the flow of the process.
+                existing.sockets.update(state.sockets)
+                existing.first_seen = min(existing.first_seen, state.first_seen)
+                if not existing.process and row.process:
+                    existing.process = row.process
+                del self._flows[old_key]
+                merged.append(old_key)
+        return renamed, merged
 
     def _elapsed(self, now: float) -> float:
         """Return the length of the poll that ends now, in seconds.

@@ -182,6 +182,54 @@ def test_a_closed_record_holds_only_the_key():
     assert record["type"] == "closed"
 
 
+def test_a_renamed_flow_closes_the_old_key_and_opens_the_new_one():
+    table = FlowTable(FakeResolver(), poll_ms=1000)
+    table.update(
+        [
+            SocketRow(
+                proto="tcp",
+                local=("10.0.0.2", 51000),
+                remote=("1.1.1.1", 443),
+                state="ESTAB",
+                pid=None,
+                process=None,
+                bytes_sent=1000,
+                bytes_received=0,
+                key="tcp|10.0.0.2:51000|1.1.1.1:443",
+            )
+        ],
+        now=0.0,
+    )
+    events = table.update(
+        [
+            SocketRow(
+                proto="tcp",
+                local=("10.0.0.2", 51000),
+                remote=("1.1.1.1", 443),
+                state="ESTAB",
+                pid=100,
+                process="curl",
+                bytes_sent=3000,
+                bytes_received=0,
+                key="tcp|10.0.0.2:51000|1.1.1.1:443",
+            )
+        ],
+        now=1.0,
+    )
+    out = io.StringIO()
+    dump_events(events, now=1.0, out=out)
+    records = [json.loads(line) for line in out.getvalue().splitlines()]
+    assert [record["type"] for record in records] == ["closed", "opened", "updated"]
+    # The old key is closed and the new one is opened at the same
+    # moment: no key of the dump is left open.
+    assert records[0]["key"] == "1.1.1.1|None|tcp"
+    assert (records[0]["t"], records[1]["t"]) == (1.0, 1.0)
+    assert (records[1]["pid"], records[1]["process"]) == (100, "curl")
+    assert records[1]["tx"] == 3000
+    # The delta of the poll that learned the process is not lost.
+    assert records[2]["dtx"] == 2000
+
+
 def test_a_flow_without_a_process_is_written_as_null():
     out = io.StringIO()
     table = FlowTable(FakeResolver(), poll_ms=1000)

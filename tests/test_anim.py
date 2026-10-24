@@ -24,7 +24,7 @@ from trafficmap.anim import (
     Pulse,
 )
 from trafficmap.braille import Canvas
-from trafficmap.flows import Closed, Flow, Opened, Updated
+from trafficmap.flows import Closed, Flow, Opened, Renamed, Updated
 from trafficmap.geo import Geo
 from trafficmap.projection import Viewport, great_circle, project
 
@@ -358,6 +358,33 @@ def test_a_closed_flow_drops_its_peer():
     a.handle_event(Opened(flow=flow()), now=0.0)
     assert len(a.peers) == 1
     a.handle_event(Closed(key="1.1.1.1|100|tcp"), now=1.0)
+    assert a.peers == []
+
+
+def test_a_renamed_flow_keeps_its_peer_and_its_spark():
+    """The process of a flow is known later: the flow is not new."""
+    old = flow(key="1.1.1.1|None|tcp")
+    new = flow()
+    a = Animator()
+    a.anchor = ANCHOR
+    a.handle_event(Opened(flow=old), now=0.0)
+    a.spawn_pulse(GREENWICH, born=0.5, flow_key=old.key)
+    a.set_hidden({new.key})
+
+    a.handle_event(Renamed(key=old.key, flow=new), now=1.0)
+
+    # No new comet: the flow has not carried anything new.
+    assert len(a.comets) == 1
+    # The peer is the same peer, under the new key.
+    assert len(a.peers) == 1
+
+    # The spark follows the filter of the flow it belongs to.
+    canvas = Canvas(100, 50)
+    a.draw(canvas, WORLD, now=1.0)
+    assert STYLE_PULSE not in styles_on(canvas)
+    assert STYLE_PULSE_DIM not in styles_on(canvas)
+
+    a.handle_event(Closed(key=new.key), now=2.0)
     assert a.peers == []
 
 
