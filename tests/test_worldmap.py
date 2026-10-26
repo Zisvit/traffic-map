@@ -11,6 +11,7 @@ from trafficmap.worldmap import (
     BORDER_HORIZONTAL,
     BORDER_VERTICAL,
     border_cells,
+    coastline,
     load_geojson,
     load_land,
     rasterize,
@@ -248,9 +249,7 @@ def test_stale_cache_files_are_removed(tmp_path):
 # -- the viewports of the zoom ------------------------------------------
 
 
-def _viewport_index(
-    lon: float, lat: float, viewport: Viewport
-) -> int:
+def _viewport_index(lon: float, lat: float, viewport: Viewport) -> int:
     """Return the index of a coordinate in the mask of a viewport.
 
     The longitude is wrapped around the centre of the view, the way
@@ -259,8 +258,7 @@ def _viewport_index(
     dlon = (lon - viewport.center_lon + 180.0) % 360.0 - 180.0
     x = int((dlon / viewport.lon_span + 0.5) * (viewport.width - 1) + 0.5)
     y = int(
-        (0.5 - (lat - viewport.center_lat) / viewport.lat_span)
-        * (viewport.height - 1)
+        (0.5 - (lat - viewport.center_lat) / viewport.lat_span) * (viewport.height - 1)
         + 0.5
     )
     assert 0 <= x < viewport.width, f"x={x} is outside the mask"
@@ -310,7 +308,13 @@ def test_a_viewport_over_the_antimeridian_draws_both_sides():
         "geometry": {
             "type": "Polygon",
             "coordinates": [
-                [[170.0, 10.0], [180.0, 10.0], [180.0, 30.0], [170.0, 30.0], [170.0, 10.0]]
+                [
+                    [170.0, 10.0],
+                    [180.0, 10.0],
+                    [180.0, 30.0],
+                    [170.0, 30.0],
+                    [170.0, 10.0],
+                ]
             ],
         },
     }
@@ -351,7 +355,13 @@ def test_a_viewport_does_not_borrow_the_land_of_the_other_side():
         "geometry": {
             "type": "Polygon",
             "coordinates": [
-                [[170.0, 10.0], [180.0, 10.0], [180.0, 30.0], [170.0, 30.0], [170.0, 10.0]]
+                [
+                    [170.0, 10.0],
+                    [180.0, 10.0],
+                    [180.0, 30.0],
+                    [170.0, 30.0],
+                    [170.0, 10.0],
+                ]
             ],
         },
     }
@@ -463,3 +473,36 @@ def test_a_multi_line_border_is_drawn():
     )
     assert (1, 4) in cells or (2, 4) in cells
     assert (1, 6) in cells or (2, 6) in cells
+
+
+def test_coastline_of_one_land_dot_is_one_dot():
+    mask = bytearray(5 * 5)
+    mask[2 * 5 + 2] = 1
+
+    edge = coastline(mask, 5, 5)
+
+    assert sum(edge) == 1
+    assert edge[2 * 5 + 2] == 1
+
+
+def test_coastline_of_all_land_is_empty():
+    mask = bytearray([1] * (5 * 5))
+
+    assert sum(coastline(mask, 5, 5)) == 0
+
+
+def test_coastline_keeps_the_inside_of_a_block():
+    mask = bytearray(5 * 5)
+    for y in range(1, 4):
+        for x in range(1, 4):
+            mask[y * 5 + x] = 1
+
+    edge = coastline(mask, 5, 5)
+
+    assert sum(edge) == 8
+    assert edge[2 * 5 + 2] == 0
+
+
+def test_coastline_rejects_a_mask_of_another_size():
+    with pytest.raises(ValueError):
+        coastline(bytearray(4), 3, 3)

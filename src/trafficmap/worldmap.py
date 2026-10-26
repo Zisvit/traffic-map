@@ -41,7 +41,7 @@ from PIL import Image, ImageDraw
 
 from trafficmap.projection import Viewport
 
-__all__ = ["rasterize", "load_land", "load_geojson", "border_cells"]
+__all__ = ["rasterize", "coastline", "load_land", "load_geojson", "border_cells"]
 
 #: Translation table that turns the gray pixels of the image into bits.
 _TO_BIT = bytes(1 if value else 0 for value in range(256))
@@ -140,6 +140,48 @@ def rasterize(
     # The "1" mode packs eight pixels into a byte, so the image is
     # widened to "L" first to get one byte per pixel.
     return bytearray(image.convert("L").tobytes().translate(_TO_BIT))
+
+
+def coastline(mask: bytes | bytearray, width: int, height: int) -> bytearray:
+    """Return the dots of the mask that touch water.
+
+    A land dot is a coast dot when at least one of its four neighbours
+    is water.  The neighbour outside the grid counts as land: a view
+    that cuts through a continent must not draw a frame along the edge
+    of the screen.
+
+    Args:
+        mask: Flat row-major mask, one entry per dot, non-zero for land.
+        width: Width of the mask in dots.
+        height: Height of the mask in dots.
+
+    Returns:
+        A mask of the same size with ``1`` on the coast and ``0``
+        elsewhere.
+
+    Raises:
+        ValueError: If the size is not positive or the mask length does
+            not match the size.
+    """
+    if width < 1 or height < 1:
+        raise ValueError(f"mask size must be positive, got {width}x{height}")
+    if len(mask) != width * height:
+        raise ValueError(f"mask must hold {width * height} dots, got {len(mask)}")
+    edge = bytearray(len(mask))
+    for y in range(height):
+        row = y * width
+        for x in range(width):
+            index = row + x
+            if not mask[index]:
+                continue
+            if (
+                (x > 0 and not mask[index - 1])
+                or (x < width - 1 and not mask[index + 1])
+                or (y > 0 and not mask[index - width])
+                or (y < height - 1 and not mask[index + width])
+            ):
+                edge[index] = 1
+    return edge
 
 
 def _shifts_of(viewport: Viewport | None) -> tuple[float, ...]:
