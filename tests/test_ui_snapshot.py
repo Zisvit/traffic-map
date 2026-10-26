@@ -388,3 +388,14 @@ class TestMockCollector:
     def test_a_missing_recording_is_refused(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             MockCollector(tmp_path / "nope.jsonl")
+
+
+def test_snapshot_draws_a_coast_not_a_filled_land(tmp_path):
+    text = make_snapshot(tmp_path, "--ascii")
+    map_text = "\n".join(text.splitlines()[:-3])
+    land_cells = sum(1 for char in map_text if char in "#*+O-")
+
+    assert land_cells > 0, "the map is empty"
+    assert land_cells < len(map_text.replace("\n", "")) // 2, (
+        "the land is still filled"
+    )

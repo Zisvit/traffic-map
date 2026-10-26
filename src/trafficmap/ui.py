@@ -103,6 +103,7 @@ from trafficmap.worldmap import (
     BORDER_UP,
     BORDER_VERTICAL,
     border_cells,
+    coastline,
     load_geojson,
     load_land,
     rasterize,
@@ -530,6 +531,8 @@ class _Map:
         self._geojson: dict | None = None
         self._visible: bytearray | None = None
         self._visible_key: tuple[float, ...] | None = None
+        self._coast: bytearray | None = None
+        self._coast_key: tuple[float, ...] | None = None
         self._borders: dict[tuple[int, int], int] | None = None
         self._borders_key: tuple[float, ...] | None = None
         self._borders_geojson: dict | None = None
@@ -551,6 +554,8 @@ class _Map:
         """Forget the masks that were built for the old view."""
         self._visible = None
         self._visible_key = None
+        self._coast = None
+        self._coast_key = None
         self._borders = None
         self._borders_key = None
 
@@ -728,6 +733,32 @@ class _Map:
         self._visible = visible
         self._visible_key = key
         return visible
+
+    def coastline_mask(self) -> bytearray:
+        """Return the coast of the visible part of the world.
+
+        The coast is derived from the filled land mask and cached for
+        the same view: it changes only when the view changes, not on
+        every frame.
+
+        Returns:
+            One byte per dot of the canvas: ``1`` on the coast, ``0``
+            elsewhere.
+        """
+        viewport = self.viewport()
+        key = (
+            float(self.canvas.width),
+            float(self.canvas.height),
+            round(viewport.lon_span, 9),
+            round(viewport.lat_span, 9),
+            round(viewport.center_lat, 6),
+            round(viewport.center_lon, 6),
+        )
+        if self._coast is not None and self._coast_key == key:
+            return self._coast
+        self._coast = coastline(self.land_mask(), self.canvas.width, self.canvas.height)
+        self._coast_key = key
+        return self._coast
 
     def borders(self) -> dict[tuple[int, int], int]:
         """Return the country borders of the visible part of the world.
@@ -1383,7 +1414,7 @@ def _render(map_: _Map, state: _State, now: float, stats: Stats) -> _Frame:
     """
     canvas = map_.canvas
     canvas.clear()
-    canvas.blit_land(map_.land_mask())
+    canvas.blit_land(map_.coastline_mask())
     viewport = map_.viewport()
     state.animator.draw(canvas, viewport, now)
 
@@ -2455,9 +2486,7 @@ def run(cfg: Config) -> int:
         print("TUI requires a terminal", file=sys.stderr)
         return 2
     try:
-        resolver = GeoResolver(
-            cfg.city_db, cfg.asn_db, cfg.cache_dir, scatter=True
-        )
+        resolver = GeoResolver(cfg.city_db, cfg.asn_db, cfg.cache_dir, scatter=True)
     except FileNotFoundError as exc:
         print(f"tmap: {exc}", file=sys.stderr)
         print("tmap: run 'make assets' to download the databases", file=sys.stderr)
@@ -2504,9 +2533,7 @@ def snapshot(cfg: Config, path: Path, frames: int) -> int:
         ``0`` when the frame was written, ``2`` when it cannot be.
     """
     try:
-        resolver = GeoResolver(
-            cfg.city_db, cfg.asn_db, cfg.cache_dir, scatter=True
-        )
+        resolver = GeoResolver(cfg.city_db, cfg.asn_db, cfg.cache_dir, scatter=True)
     except FileNotFoundError as exc:
         print(f"tmap: {exc}", file=sys.stderr)
         print("tmap: run 'make assets' to download the databases", file=sys.stderr)
