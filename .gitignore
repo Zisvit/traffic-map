@@ -7,4 +7,6 @@ dist/
 assets/*.mmdb
 assets/land.geojson
 assets/borders.geojson
+assets/countries.geojson
+assets/cities.geojson
 .pytest_cache/

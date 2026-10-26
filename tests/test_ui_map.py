@@ -43,9 +43,12 @@ from trafficmap.ui import (
     WORLD_SPAN,
     _ASCII_GLYPHS,
     _C_IN,
+    _C_CITY,
+    _C_LABEL,
     _C_WARNING,
     _CollectorThread,
     _FallbackCollector,
+    _Frame,
     _Map,
     _State,
     _anchor_overlays,
@@ -55,6 +58,7 @@ from trafficmap.ui import (
     _format_rate,
     _handle_key,
     _in_cells,
+    _place_overlays,
     _spawn_pulses,
     _status_lines,
     _text_rows,
@@ -65,12 +69,18 @@ from trafficmap.ui import (
 ASSETS = Path(__file__).resolve().parents[1] / "assets"
 LAND = ASSETS / "land.geojson"
 CITY_DB = ASSETS / "dbip-city-lite.mmdb"
+COUNTRIES = ASSETS / "countries.geojson"
+CITIES = ASSETS / "cities.geojson"
 
 needs_land = pytest.mark.skipif(
     not LAND.exists(), reason="the land map is not downloaded"
 )
 needs_city_db = pytest.mark.skipif(
     not CITY_DB.exists(), reason="the city database is not downloaded"
+)
+needs_places = pytest.mark.skipif(
+    not (COUNTRIES.exists() and CITIES.exists()),
+    reason="the country and city labels are not downloaded",
 )
 
 #: The place of this machine in the tests: Amsterdam, away from the
@@ -590,6 +600,78 @@ def test_the_anchor_is_labelled_on_a_zoomed_map():
     assert any("Amsterdam" in text for _, _, text, _ in overlays)
     map_.reset_zoom()
     assert _anchor_overlays(state, map_.viewport(), map_) == []
+
+
+def test_the_place_labels_are_on_by_default():
+    """The key ``l`` switches every place label, and starts with them on."""
+    state = _State(Config())
+    map_ = make_map(ANCHOR, 2)
+    assert state.show_labels is True
+    assert _handle_key(ord("l"), state, map_) is True
+    assert state.show_labels is False
+    _handle_key(ord("l"), state, map_)
+    assert state.show_labels is True
+
+
+@needs_places
+def test_a_zoomed_map_names_countries_and_cities():
+    """The maps of x3 and closer carry the names of the land and the cities."""
+    state = _State(Config())
+    state.anchor = ANCHOR
+    map_ = make_map(ANCHOR, 2)
+
+    overlays = _place_overlays(state, map_.viewport(), map_)
+    texts = {text for _, _, text, _ in overlays}
+
+    assert "Германия" in texts
+    assert "Лондон" in texts
+    country_colours = [colour for _, _, text, colour in overlays if text == "Германия"]
+    city_colours = [colour for _, _, text, colour in overlays if text == "Лондон"]
+    assert country_colours == [_C_LABEL]
+    assert city_colours == [_C_CITY]
+
+    map_.reset_zoom()
+    assert _place_overlays(state, map_.viewport(), map_) == []
+
+
+@needs_places
+def test_the_ascii_mode_draws_an_ascii_city_marker():
+    """The bullet of a city has a plain ASCII twin for the plain mode."""
+    cfg = Config(ascii=True)
+    state = _State(cfg)
+    state.anchor = ANCHOR
+    map_ = _Map(cfg, SNAPSHOT_COLS, SNAPSHOT_ROWS)
+    map_.anchor = ANCHOR
+    map_.zoom = ZOOM_PRESETS[2]
+
+    texts = {text for _, _, text, _ in _place_overlays(state, map_.viewport(), map_)}
+
+    assert "o" in texts
+    assert "•" not in texts
+
+
+def test_a_missing_place_file_leaves_the_map_without_labels(tmp_path):
+    """The country and city files are optional, not a reason to stop."""
+    cfg = Config(land_geojson=tmp_path / "land.geojson")
+    map_ = _Map(cfg, SNAPSHOT_COLS, SNAPSHOT_ROWS)
+    map_.anchor = ANCHOR
+    map_.zoom = ZOOM_PRESETS[2]
+    state = _State(cfg)
+
+    assert map_.places() == ([], [])
+    assert _place_overlays(state, map_.viewport(), map_) == []
+
+
+def test_the_text_of_a_frame_holds_its_overlays():
+    """A snapshot is the picture of the screen, labels and panels included."""
+    frame = _Frame(
+        cols=5,
+        map_height=1,
+        rows=[[("abcde", 0)]],
+        overlays=[(0, 1, "XY", 1)],
+    )
+
+    assert frame.text() == "aXYde\n"
 
 
 def test_a_missing_border_file_leaves_the_map_without_borders(tmp_path):

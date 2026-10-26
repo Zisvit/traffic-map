@@ -95,6 +95,14 @@ from trafficmap.flows import (
     Stats,
 )
 from trafficmap.geo import Geo, GeoResolver
+from trafficmap.places import (
+    COUNTRY_MIN_ZOOM,
+    Label,
+    Place,
+    layout_labels,
+    load_cities,
+    load_countries,
+)
 from trafficmap.projection import Viewport, project, unproject
 from trafficmap.worldmap import (
     BORDER_CROSS,
@@ -160,6 +168,12 @@ BORDER_MIN_ZOOM = 2.0
 #: The name of the country borders next to the land polygons.
 BORDERS_NAME = "borders.geojson"
 
+#: The name of the country labels next to the land polygons.
+COUNTRIES_NAME = "countries.geojson"
+
+#: The name of the city labels next to the land polygons.
+CITIES_NAME = "cities.geojson"
+
 #: Number of lines of the panel of the busiest flows.
 TOP_PANEL_ROWS = 8
 
@@ -185,7 +199,7 @@ RETRY_MAX = 5.0
 HELP_LINES = (
     " keys",
     " q  quit            space  pause the map",
-    " t  busiest flows   l  country labels",
+    " t  busiest flows   l  place labels",
     " 1 2 3  zoom        + -  finer zoom",
     " ← → ↑ ↓  pan       c  centre on me",
     " f  filter a process 0  whole world",
@@ -226,6 +240,7 @@ _PALETTE: tuple[_Colour, ...] = (
     _Colour(curses.COLOR_WHITE, -1, curses.A_DIM),  # 12: a country label
     _Colour(curses.COLOR_MAGENTA, -1, curses.A_BOLD),  # 13: a pulse
     _Colour(curses.COLOR_WHITE, -1, curses.A_DIM),  # 14: a country border
+    _Colour(curses.COLOR_CYAN, -1, curses.A_DIM),  # 15: a city label
 )
 
 _C_DEFAULT = 0
@@ -239,6 +254,7 @@ _C_PANEL = 11
 _C_LABEL = 12
 _C_PULSE = 13
 _C_BORDER = 14
+_C_CITY = 15
 
 #: The colour of every style of the canvas, for the comets that leave.
 _OUT_BY_STYLE: dict[int, int] = {
@@ -347,12 +363,23 @@ class _Frame:
     def text(self) -> str:
         """Return the frame as plain text, without any escape.
 
+        The overlays are put over the map, as the terminal shows them:
+        the labels, the panels and the arrows belong to the picture of
+        a frame.
+
         Returns:
             The lines of the map and of the status bar, one per line.
         """
-        lines = ["".join(text for text, _ in row) for row in self.rows]
+        lines = [list("".join(text for text, _ in row)) for row in self.rows]
+        for line, column, text, _colour in self.overlays:
+            if not (0 <= line < len(lines)):
+                continue
+            row = lines[line]
+            for offset, char in enumerate(text):
+                if 0 <= column + offset < len(row):
+                    row[column + offset] = char
         lines.extend("".join(text for text, _ in row) for row in self.status)
-        return "\n".join(lines) + "\n"
+        return "\n".join("".join(row) for row in lines) + "\n"
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,7 +419,7 @@ class _State:
         self.anchor_text = "anchor unknown"
         self.paused = False
         self.show_top = False
-        self.show_labels = False
+        self.show_labels = True
         self.show_help = False
         self.filter = cfg.filter_process
         self.filter_input: str | None = None
@@ -536,6 +563,8 @@ class _Map:
         self._borders: dict[tuple[int, int], int] | None = None
         self._borders_key: tuple[float, ...] | None = None
         self._borders_geojson: dict | None = None
+        self._countries: list[Place] | None = None
+        self._cities: list[Place] | None = None
 
     def resize(self, cols: int, rows: int) -> None:
         """Take the size of a new screen.
@@ -801,6 +830,26 @@ class _Map:
         self._borders_key = key
         return self._borders
 
+    def places(self) -> tuple[list[Place], list[Place]]:
+        """Return the countries and the cities of the map.
+
+        The two files are optional and are read once: a map without
+        them simply has no place labels.  A file that cannot be read is
+        not a reason to stop either; the traffic is still drawn.
+
+        Returns:
+            The countries and the cities, in the order of their files.
+        """
+        if self._countries is None:
+            self._countries = _load_places(
+                self._cfg.land_geojson.with_name(COUNTRIES_NAME), load_countries
+            )
+        if self._cities is None:
+            self._cities = _load_places(
+                self._cfg.land_geojson.with_name(CITIES_NAME), load_cities
+            )
+        return self._countries, self._cities
+
     def _zoom_mask(self, viewport: Viewport) -> bytearray:
         """Return the land of a zoomed view, drawn from the polygons.
 
@@ -824,6 +873,25 @@ class _Map:
             )
             self._world_size = size
         return self._world
+
+
+def _load_places(path: Path, loader: Callable[[Path], list[Place]]) -> list[Place]:
+    """Read a place file, or return nothing when it is unusable.
+
+    Args:
+        path: Path of the GeoJSON file.
+        loader: The function that parses the file.
+
+    Returns:
+        The places, or an empty list when the file is missing or broken.
+    """
+    if not path.exists():
+        return []
+    try:
+        return loader(path)
+    except (OSError, ValueError, TypeError) as exc:
+        log.debug("cannot read the places %s: %s", path, exc)
+        return []
 
 
 def _normalize_lon(lon: float) -> float:
@@ -1440,10 +1508,9 @@ def _render(map_: _Map, state: _State, now: float, stats: Stats) -> _Frame:
 
     overlays: list[tuple[int, int, str, int]] = []
     overlays.extend(_border_overlays(map_, style_rows, state.cfg.ascii))
+    overlays.extend(_place_overlays(state, viewport, map_))
     overlays.extend(_anchor_overlays(state, viewport, map_))
     overlays.extend(_edge_markers(state, viewport, map_))
-    if state.show_labels:
-        overlays.extend(_country_labels(state, viewport, map_))
     if state.show_top:
         overlays.extend(_top_panel(map_, state))
     if state.show_help:
@@ -1593,12 +1660,15 @@ def _edge_cell(
     return (line, column, _EDGE_ARROWS[octant])
 
 
-def _country_labels(
+def _place_overlays(
     state: _State, viewport: Viewport, map_: _Map
 ) -> list[tuple[int, int, str, int]]:
-    """Return the country labels of the peers of the map.
+    """Return the names of the countries and the cities of the view.
 
-    The label of a peer is written in the cell to the right of its dot.
+    The labels are placed on the character grid: they step aside for
+    one another, for the panels and for the dots that are already on
+    the map.  The moving comets are not part of the grid: a label that
+    stepped aside for a comet would step back a moment later.
 
     Args:
         state: What the interface knows.
@@ -1608,23 +1678,79 @@ def _country_labels(
     Returns:
         The labels, each a ``(line, column, text, colour)``.
     """
-    labels: list[tuple[int, int, str, int]] = []
+    if not state.show_labels or map_.zoom < COUNTRY_MIN_ZOOM:
+        return []
+    countries, cities = map_.places()
+    if not countries and not cities:
+        return []
+    labels: list[Label] = layout_labels(
+        countries,
+        cities,
+        viewport,
+        map_.zoom,
+        map_.cols,
+        map_.map_height,
+        _blocked_cells(state, viewport, map_),
+    )
+    overlays: list[tuple[int, int, str, int]] = []
+    for label in labels:
+        colour = _C_CITY if label.kind == "city" else _C_LABEL
+        text = label.text
+        if label.marker and state.cfg.ascii:
+            # The bullet is not an ASCII character: the plain mode
+            # keeps to the characters every font has.
+            text = "o"
+        overlays.append((label.line, label.column, text, colour))
+    return overlays
+
+
+def _blocked_cells(
+    state: _State, viewport: Viewport, map_: _Map
+) -> set[tuple[int, int]]:
+    """Return the cells a place label must leave alone.
+
+    The panels, the dot of the anchor and its name, the arrows to the
+    peers that are off the map and the dots of the peers on it.  The
+    moving comets are not here: a label that stepped aside for a comet
+    would step back a moment later.
+
+    Args:
+        state: What the interface knows.
+        viewport: The part of the world the canvas shows.
+        map_: The map.
+
+    Returns:
+        The cells that are taken, by ``(line, column)``.
+    """
+    blocked: set[tuple[int, int]] = set()
+    if state.show_top:
+        first = max(0, map_.cols - TOP_PANEL_COLUMNS)
+        for line in range(min(TOP_PANEL_ROWS + 1, map_.map_height)):
+            for column in range(first, map_.cols):
+                blocked.add((line, column))
+    if state.show_help:
+        last = min(map_.cols, 2 + HELP_PANEL_COLUMNS)
+        for line in range(min(len(HELP_LINES), map_.map_height)):
+            for column in range(2, last):
+                blocked.add((line, column))
+    for line, column, text, _colour in _anchor_overlays(state, viewport, map_):
+        for offset in range(len(text)):
+            blocked.add((line, column + offset))
+    anchor = state.anchor
+    if anchor is not None and anchor.lat is not None and anchor.lon is not None:
+        point = project(anchor.lat, anchor.lon, viewport)
+        if point is not None:
+            blocked.add((point[1] // 4, point[0] // 2))
     for peer in state.animator.visible_peers:
         geo = peer.geo
         if geo.lat is None or geo.lon is None:
             continue
-        country = geo.country
-        if not country or country == "--":
-            continue
         point = project(geo.lat, geo.lon, viewport)
-        if point is None:
-            continue
-        line = point[1] // 4
-        column = point[0] // 2 + 1
-        if line >= map_.map_height or column + 2 > map_.cols:
-            continue
-        labels.append((line, column, country, _C_LABEL))
-    return labels
+        if point is not None:
+            blocked.add((point[1] // 4, point[0] // 2))
+    for line, column, _text, _colour in _edge_markers(state, viewport, map_):
+        blocked.add((line, column))
+    return blocked
 
 
 def _top_panel(map_: _Map, state: _State) -> list[tuple[int, int, str, int]]:

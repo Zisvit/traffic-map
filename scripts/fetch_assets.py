@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Download the offline assets the traffic map needs.
 
-Four files are fetched into the ``assets`` directory of the repository:
+Six files are fetched into the ``assets`` directory of the repository:
 
 * ``land.geojson`` -- Natural Earth 110m land polygons (public domain),
   the raster background of the world map;
 * ``borders.geojson`` -- Natural Earth 110m country borders (public
   domain), drawn over the land when the map is zoomed in;
+* ``countries.geojson`` -- Natural Earth 110m countries (public domain),
+  the country names and the points their labels belong to;
+* ``cities.geojson`` -- Natural Earth 50m populated places (public
+  domain), the dots and names of the cities;
 * ``dbip-city-lite.mmdb`` -- DB-IP Lite City database (CC BY 4.0);
 * ``dbip-asn-lite.mmdb`` -- DB-IP Lite ASN database (CC BY 4.0).
 
@@ -71,6 +75,14 @@ LAND_URL = (
 BORDERS_URL = (
     "https://raw.githubusercontent.com/nvkelso/natural-earth-vector"
     "/master/geojson/ne_110m_admin_0_boundary_lines_land.geojson"
+)
+COUNTRIES_URL = (
+    "https://raw.githubusercontent.com/nvkelso/natural-earth-vector"
+    "/master/geojson/ne_110m_admin_0_countries.geojson"
+)
+CITIES_URL = (
+    "https://raw.githubusercontent.com/nvkelso/natural-earth-vector"
+    "/master/geojson/ne_50m_populated_places.geojson"
 )
 CITY_URL = "https://download.db-ip.com/free/dbip-city-lite-{ym}.mmdb.gz"
 ASN_URL = "https://download.db-ip.com/free/dbip-asn-lite-{ym}.mmdb.gz"
@@ -151,6 +163,8 @@ def validate_mmdb(data: bytes) -> None:
 ASSETS: tuple[Asset, ...] = (
     Asset(name="land.geojson", url=LAND_URL, validate=validate_geojson),
     Asset(name="borders.geojson", url=BORDERS_URL, validate=validate_geojson),
+    Asset(name="countries.geojson", url=COUNTRIES_URL, validate=validate_geojson),
+    Asset(name="cities.geojson", url=CITIES_URL, validate=validate_geojson),
     Asset(
         name="dbip-city-lite.mmdb",
         url=CITY_URL,
