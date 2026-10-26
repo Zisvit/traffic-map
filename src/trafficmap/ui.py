@@ -10,7 +10,7 @@ four rows of dots, so a terminal of 200x50 characters shows a world of
 
 The colours
 -----------
-The land is dark blue, the anchor is white, the peers are yellow, the
+The coast is dark blue, the anchor is white, the peers are yellow, the
 comets that leave the machine are green and the ones that come to it
 are cyan; the tail of a comet fades in three steps.  The status bar is
 in the colours of the terminal, the warnings are yellow and bold, and
